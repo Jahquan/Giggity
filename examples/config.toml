@@ -1,0 +1,30 @@
+refresh_seconds = 2
+startup_grace_seconds = 10
+host_event_ttl_seconds = 60
+default_view = "default"
+
+[sources]
+docker = true
+podman = true
+nerdctl = true
+host_listeners = true
+launchd = true
+systemd = true
+
+[views.default]
+grouping = "severity"
+sorting = "severity"
+hide = ["^com\\.apple\\."]
+pinned = ["docker:web", "docker:db"]
+
+[views.default.status_bar]
+template = "svc {total} ok {healthy} warn {degraded} down {crashed} stop {stopped} src {collector_warnings} [{issues}]"
+max_issue_names = 3
+show_empty = false
+
+[[probes]]
+name = "api-health"
+probe = "http"
+name_regex = "^api$"
+url = "http://127.0.0.1:{port}/health"
+expected_status = 200

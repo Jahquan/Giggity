@@ -1,0 +1,19 @@
+services:
+  web:
+    build:
+      context: ./basic-http
+    image: giggity/basic-http:local
+    container_name: giggity-fixture-web
+    ports:
+      - "18081:8080"
+    labels:
+      com.giggity.fixture: "true"
+      com.giggity.fixture.role: "web"
+
+  worker:
+    image: giggity/basic-http:local
+    container_name: giggity-fixture-worker
+    command: ["sh", "-c", "sleep 3600"]
+    labels:
+      com.giggity.fixture: "true"
+      com.giggity.fixture.role: "worker"

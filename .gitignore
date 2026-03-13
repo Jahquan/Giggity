@@ -1,0 +1,7 @@
+/target
+/.DS_Store
+**/.DS_Store
+mutants.out/
+mutants.out.old/
+/scripts/giggity
+/result
