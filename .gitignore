@@ -3,5 +3,7 @@
 **/.DS_Store
 mutants.out/
 mutants.out.old/
+mutants*.out/
 /scripts/giggity
+/scripts/giggity *
 /result
