@@ -74,7 +74,9 @@ impl FromStr for HealthState {
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Container,
+    ComposeStack,
     HostProcess,
+    KubernetesPod,
     LaunchdUnit,
     SystemdUnit,
 }
@@ -83,7 +85,9 @@ impl Display for ResourceKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let text = match self {
             ResourceKind::Container => "container",
+            ResourceKind::ComposeStack => "compose_stack",
             ResourceKind::HostProcess => "host_process",
+            ResourceKind::KubernetesPod => "kubernetes_pod",
             ResourceKind::LaunchdUnit => "launchd_unit",
             ResourceKind::SystemdUnit => "systemd_unit",
         };
@@ -97,6 +101,7 @@ pub enum RuntimeKind {
     Docker,
     Podman,
     Nerdctl,
+    Kubernetes,
     Host,
     Launchd,
     Systemd,
@@ -108,6 +113,7 @@ impl Display for RuntimeKind {
             RuntimeKind::Docker => "docker",
             RuntimeKind::Podman => "podman",
             RuntimeKind::Nerdctl => "nerdctl",
+            RuntimeKind::Kubernetes => "kubernetes",
             RuntimeKind::Host => "host",
             RuntimeKind::Launchd => "launchd",
             RuntimeKind::Systemd => "systemd",
@@ -151,11 +157,43 @@ pub struct ResourceRecord {
 
 impl ResourceRecord {
     pub fn summary_name(&self) -> String {
+        if self.kind == ResourceKind::ComposeStack {
+            return match self.ports.first() {
+                Some(port) => format!("{}:{}", self.name, port.host_port),
+                None => self.name.clone(),
+            };
+        }
+
+        if self.kind == ResourceKind::KubernetesPod {
+            let namespace = self
+                .namespace()
+                .or(self.project.as_deref())
+                .unwrap_or_default();
+            return match (namespace.is_empty(), self.ports.first()) {
+                (false, Some(port)) => format!("{namespace}/{}:{}", self.name, port.host_port),
+                (false, None) => format!("{namespace}/{}", self.name),
+                (true, Some(port)) => format!("{}:{}", self.name, port.host_port),
+                (true, None) => self.name.clone(),
+            };
+        }
+
         match (&self.project, self.ports.first()) {
             (Some(project), Some(port)) => format!("{project}/{}:{}", self.name, port.host_port),
             (_, Some(port)) => format!("{}:{}", self.name, port.host_port),
             _ => self.name.clone(),
         }
+    }
+
+    pub fn namespace(&self) -> Option<&str> {
+        self.metadata.get("namespace").map(String::as_str)
+    }
+
+    pub fn compose_project(&self) -> Option<&str> {
+        self.labels
+            .get("com.docker.compose.project")
+            .or_else(|| self.labels.get("io.podman.compose.project"))
+            .map(String::as_str)
+            .or(self.project.as_deref())
     }
 }
 
@@ -228,6 +266,8 @@ impl Default for Snapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chrono::Utc;
 
     use super::{
@@ -287,6 +327,86 @@ mod tests {
     }
 
     #[test]
+    fn summary_name_handles_compose_stacks_and_kubernetes_pods() {
+        let record = ResourceRecord {
+            id: "docker:web".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: Some("stack".into()),
+            name: "web".into(),
+            state: HealthState::Healthy,
+            runtime_status: None,
+            ports: vec![PortBinding {
+                host_ip: None,
+                host_port: 8080,
+                container_port: Some(80),
+                protocol: "tcp".into(),
+            }],
+            labels: BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: Utc::now(),
+        };
+
+        assert_eq!(
+            ResourceRecord {
+                kind: ResourceKind::ComposeStack,
+                name: "stack".into(),
+                ..record.clone()
+            }
+            .summary_name(),
+            "stack:8080"
+        );
+        assert_eq!(
+            ResourceRecord {
+                kind: ResourceKind::KubernetesPod,
+                runtime: RuntimeKind::Kubernetes,
+                project: Some("dev".into()),
+                name: "api".into(),
+                metadata: BTreeMap::from([("namespace".into(), "dev".into())]),
+                ..record.clone()
+            }
+            .summary_name(),
+            "dev/api:8080"
+        );
+        assert_eq!(
+            ResourceRecord {
+                kind: ResourceKind::ComposeStack,
+                name: "stack".into(),
+                ports: Vec::new(),
+                ..record.clone()
+            }
+            .summary_name(),
+            "stack"
+        );
+        assert_eq!(
+            ResourceRecord {
+                kind: ResourceKind::KubernetesPod,
+                runtime: RuntimeKind::Kubernetes,
+                project: None,
+                name: "api".into(),
+                metadata: BTreeMap::new(),
+                ..record.clone()
+            }
+            .summary_name(),
+            "api:8080"
+        );
+        assert_eq!(
+            ResourceRecord {
+                kind: ResourceKind::KubernetesPod,
+                runtime: RuntimeKind::Kubernetes,
+                project: None,
+                name: "api".into(),
+                ports: Vec::new(),
+                metadata: BTreeMap::new(),
+                ..record
+            }
+            .summary_name(),
+            "api"
+        );
+    }
+
+    #[test]
     fn health_state_round_trips_through_display_and_parse() {
         for state in [
             HealthState::Healthy,
@@ -307,13 +427,37 @@ mod tests {
         assert_eq!(RuntimeKind::Docker.to_string(), "docker");
         assert_eq!(RuntimeKind::Podman.to_string(), "podman");
         assert_eq!(RuntimeKind::Nerdctl.to_string(), "nerdctl");
+        assert_eq!(RuntimeKind::Kubernetes.to_string(), "kubernetes");
         assert_eq!(RuntimeKind::Host.to_string(), "host");
         assert_eq!(RuntimeKind::Launchd.to_string(), "launchd");
         assert_eq!(RuntimeKind::Systemd.to_string(), "systemd");
         assert_eq!(ResourceKind::Container.to_string(), "container");
+        assert_eq!(ResourceKind::ComposeStack.to_string(), "compose_stack");
         assert_eq!(ResourceKind::HostProcess.to_string(), "host_process");
+        assert_eq!(ResourceKind::KubernetesPod.to_string(), "kubernetes_pod");
         assert_eq!(ResourceKind::LaunchdUnit.to_string(), "launchd_unit");
         assert_eq!(ResourceKind::SystemdUnit.to_string(), "systemd_unit");
+    }
+
+    #[test]
+    fn helpers_return_namespace_and_compose_project() {
+        let record = ResourceRecord {
+            id: "docker:web".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: Some("fallback".into()),
+            name: "web".into(),
+            state: HealthState::Healthy,
+            runtime_status: None,
+            ports: Vec::new(),
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "stack".into())]),
+            urls: Vec::new(),
+            metadata: BTreeMap::from([("namespace".into(), "dev".into())]),
+            last_changed: Utc::now(),
+        };
+
+        assert_eq!(record.namespace(), Some("dev"));
+        assert_eq!(record.compose_project(), Some("stack"));
     }
 
     #[test]

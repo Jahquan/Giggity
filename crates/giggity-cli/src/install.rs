@@ -220,7 +220,7 @@ mod tests {
         install_service, install_systemd_service_at, launchd_destination, launchd_plist,
         systemd_destination, systemd_unit, uid, write_service_file,
     };
-    use crate::test_support::EnvVarGuard;
+    use giggity_core::test_support::EnvVarGuard;
 
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 

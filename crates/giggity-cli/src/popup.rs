@@ -424,9 +424,10 @@ impl PopupApp {
                     match self.local_grouping.clone().unwrap_or(GroupBy::Severity) {
                         GroupBy::Severity => GroupBy::Runtime,
                         GroupBy::Runtime => GroupBy::Project,
-                        GroupBy::Project => GroupBy::None,
+                        GroupBy::Project => GroupBy::Namespace,
+                        GroupBy::Namespace => GroupBy::ComposeStack,
                         GroupBy::ComposeStack => GroupBy::UnitDomain,
-                        GroupBy::UnitDomain => GroupBy::Severity,
+                        GroupBy::UnitDomain => GroupBy::None,
                         GroupBy::None => GroupBy::Severity,
                     },
                 );
@@ -1073,8 +1074,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn popup_grouping_cycles_through_compose_stack_and_unit_domain() {
+    async fn popup_grouping_cycles_through_compose_stack_namespace_and_unit_domain() {
         let (mut app, shutdown_tx, _dir) = spawn_popup_app().await;
+        app.local_grouping = Some(giggity_core::config::GroupBy::Project);
+        app.handle_key(crossterm::event::KeyCode::Char('g'))
+            .await
+            .expect("cycle project");
+        assert!(matches!(
+            app.local_grouping,
+            Some(giggity_core::config::GroupBy::Namespace)
+        ));
+        app.handle_key(crossterm::event::KeyCode::Char('g'))
+            .await
+            .expect("cycle namespace");
+        assert!(matches!(
+            app.local_grouping,
+            Some(giggity_core::config::GroupBy::ComposeStack)
+        ));
         app.local_grouping = Some(giggity_core::config::GroupBy::ComposeStack);
         app.handle_key(crossterm::event::KeyCode::Char('g'))
             .await
@@ -1086,6 +1102,13 @@ mod tests {
         app.handle_key(crossterm::event::KeyCode::Char('g'))
             .await
             .expect("cycle unit domain");
+        assert!(matches!(
+            app.local_grouping,
+            Some(giggity_core::config::GroupBy::None)
+        ));
+        app.handle_key(crossterm::event::KeyCode::Char('g'))
+            .await
+            .expect("cycle none");
         assert!(matches!(
             app.local_grouping,
             Some(giggity_core::config::GroupBy::Severity)
@@ -1353,7 +1376,28 @@ mod tests {
         );
         app.handle_key(KeyCode::Char('g'))
             .await
-            .expect("project->none");
+            .expect("project->namespace");
+        assert_eq!(
+            app.local_grouping,
+            Some(giggity_core::config::GroupBy::Namespace)
+        );
+        app.handle_key(KeyCode::Char('g'))
+            .await
+            .expect("namespace->compose_stack");
+        assert_eq!(
+            app.local_grouping,
+            Some(giggity_core::config::GroupBy::ComposeStack)
+        );
+        app.handle_key(KeyCode::Char('g'))
+            .await
+            .expect("compose_stack->unit_domain");
+        assert_eq!(
+            app.local_grouping,
+            Some(giggity_core::config::GroupBy::UnitDomain)
+        );
+        app.handle_key(KeyCode::Char('g'))
+            .await
+            .expect("unit_domain->none");
         assert_eq!(
             app.local_grouping,
             Some(giggity_core::config::GroupBy::None)

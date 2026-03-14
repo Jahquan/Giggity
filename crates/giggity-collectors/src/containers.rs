@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
@@ -52,6 +52,10 @@ pub async fn collect(config: &Config) -> CollectionOutput {
             }),
         }
     }
+
+    let mut stacks = synthesize_compose_stacks(&output.resources);
+    enrich_compose_stacks(&mut stacks).await;
+    output.resources.extend(stacks);
 
     output
 }
@@ -180,6 +184,354 @@ async fn collect_nerdctl() -> anyhow::Result<Vec<ResourceRecord>> {
         records.push(nerdctl_record(item));
     }
     Ok(records)
+}
+
+fn synthesize_compose_stacks(resources: &[ResourceRecord]) -> Vec<ResourceRecord> {
+    let mut grouped: BTreeMap<(RuntimeKind, String), Vec<&ResourceRecord>> = BTreeMap::new();
+
+    for resource in resources {
+        if resource.kind != ResourceKind::Container {
+            continue;
+        }
+        let Some(project) = resource.compose_project() else {
+            continue;
+        };
+        grouped
+            .entry((resource.runtime, project.to_string()))
+            .or_default()
+            .push(resource);
+    }
+
+    grouped
+        .into_iter()
+        .filter(|(_, members)| members.len() > 1)
+        .map(|((runtime, project), members)| compose_stack_record(runtime, &project, &members))
+        .collect()
+}
+
+async fn enrich_compose_stacks(resources: &mut [ResourceRecord]) {
+    for resource in resources {
+        let _ = enrich_compose_stack(resource).await;
+    }
+}
+
+async fn enrich_compose_stack(resource: &mut ResourceRecord) -> anyhow::Result<()> {
+    if resource.kind != ResourceKind::ComposeStack {
+        return Ok(());
+    }
+    let Some(project) = resource.compose_project().map(str::to_owned) else {
+        return Ok(());
+    };
+
+    let Some(mut details) = compose_project_details(resource.runtime, &project).await? else {
+        return Ok(());
+    };
+
+    resource.state = compose_stack_state(
+        details.healthy,
+        details.starting,
+        details.degraded,
+        details.crashed,
+        details.stopped,
+        details.unknown,
+    );
+    resource.runtime_status = Some(format!(
+        "{}/{} running",
+        details.running_count, details.service_count
+    ));
+    resource
+        .metadata
+        .insert("compose_running_count".into(), details.running_count.to_string());
+    resource
+        .metadata
+        .insert("compose_service_count".into(), details.service_count.to_string());
+    resource.metadata.insert(
+        "compose_services".into(),
+        details.services.join(","),
+    );
+    if let Some(status) = details.project_status.take() {
+        resource.metadata.insert("compose_status".into(), status);
+    }
+    if let Some(config_files) = details.config_files.take() {
+        resource
+            .metadata
+            .insert("compose_config_files".into(), config_files);
+    }
+
+    Ok(())
+}
+
+async fn compose_project_details(
+    runtime: RuntimeKind,
+    project: &str,
+) -> anyhow::Result<Option<ComposeProjectDetails>> {
+    let Some(program) = compose_program(runtime) else {
+        return Ok(None);
+    };
+    let ps_output = run_command(
+        "containers",
+        program,
+        &[
+            "compose",
+            "--project-name",
+            project,
+            "ps",
+            "-a",
+            "--format",
+            "json",
+        ],
+    )
+    .await?;
+    let entries = parse_compose_ps_output(&ps_output)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let mut details = ComposeProjectDetails::default();
+    let mut services = BTreeSet::new();
+    for entry in &entries {
+        let service_name = entry
+            .service
+            .as_ref()
+            .or(entry.name.as_ref())
+            .cloned()
+            .unwrap_or_else(|| project.to_string());
+        services.insert(service_name);
+        if entry.state.as_deref() == Some("running") {
+            details.running_count += 1;
+        }
+        match compose_entry_state(runtime, entry) {
+            HealthState::Healthy => details.healthy += 1,
+            HealthState::Starting => details.starting += 1,
+            HealthState::Degraded => details.degraded += 1,
+            HealthState::Crashed => details.crashed += 1,
+            HealthState::Stopped => details.stopped += 1,
+            HealthState::Unknown => details.unknown += 1,
+        }
+    }
+    details.service_count = entries.len();
+    details.services = services.into_iter().collect();
+
+    if runtime == RuntimeKind::Docker
+        && let Some(project_row) = compose_ls_details(program, project).await?
+    {
+        details.project_status = project_row.status;
+        details.config_files = project_row.config_files;
+    }
+
+    Ok(Some(details))
+}
+
+async fn compose_ls_details(
+    program: &str,
+    project: &str,
+) -> anyhow::Result<Option<ComposeLsEntry>> {
+    let output = run_command("containers", program, &["compose", "ls", "-a", "--format", "json"])
+        .await?;
+    let entries: Vec<ComposeLsEntry> = serde_json::from_str(&output)?;
+    Ok(entries.into_iter().find(|entry| entry.name == project))
+}
+
+fn parse_compose_ps_output(output: &str) -> anyhow::Result<Vec<ComposePsEntry>> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        return serde_json::from_str(trimmed).map_err(anyhow::Error::from);
+    }
+
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(anyhow::Error::from))
+        .collect()
+}
+
+fn compose_entry_state(runtime: RuntimeKind, entry: &ComposePsEntry) -> HealthState {
+    let status = entry.status.as_deref();
+    match runtime {
+        RuntimeKind::Docker => docker_state(entry.state.clone(), status),
+        _ => container_state_from_strings(entry.state.as_deref(), status),
+    }
+}
+
+fn compose_program(runtime: RuntimeKind) -> Option<&'static str> {
+    match runtime {
+        RuntimeKind::Docker => Some("docker"),
+        RuntimeKind::Podman => Some("podman"),
+        RuntimeKind::Nerdctl => Some("nerdctl"),
+        _ => None,
+    }
+}
+
+fn compose_stack_record(
+    runtime: RuntimeKind,
+    project: &str,
+    members: &[&ResourceRecord],
+) -> ResourceRecord {
+    let mut ports = Vec::new();
+    let mut seen_ports = BTreeSet::new();
+    let mut services = BTreeSet::new();
+    let mut labels = BTreeMap::new();
+    let mut latest_change = members
+        .first()
+        .map(|member| member.last_changed)
+        .unwrap_or_else(chrono::Utc::now);
+
+    let mut healthy = 0_usize;
+    let mut starting = 0_usize;
+    let mut degraded = 0_usize;
+    let mut crashed = 0_usize;
+    let mut stopped = 0_usize;
+    let mut unknown = 0_usize;
+
+    for member in members {
+        latest_change = latest_change.max(member.last_changed);
+        services.insert(member.name.clone());
+        for port in &member.ports {
+            let key = (
+                port.host_ip.clone(),
+                port.host_port,
+                port.container_port,
+                port.protocol.clone(),
+            );
+            if seen_ports.insert(key) {
+                ports.push(port.clone());
+            }
+        }
+        if labels.is_empty() {
+            labels = member.labels.clone();
+        }
+        match member.state {
+            HealthState::Healthy => healthy += 1,
+            HealthState::Starting => starting += 1,
+            HealthState::Degraded => degraded += 1,
+            HealthState::Crashed => crashed += 1,
+            HealthState::Stopped => stopped += 1,
+            HealthState::Unknown => unknown += 1,
+        }
+    }
+
+    let state = compose_stack_state(healthy, starting, degraded, crashed, stopped, unknown);
+    let total = members.len();
+    let urls = guess_local_urls_for_ports(&ports);
+    let mut metadata = BTreeMap::from([
+        ("service_count".into(), total.to_string()),
+        ("healthy_count".into(), healthy.to_string()),
+        ("starting_count".into(), starting.to_string()),
+        ("degraded_count".into(), degraded.to_string()),
+        ("crashed_count".into(), crashed.to_string()),
+        ("stopped_count".into(), stopped.to_string()),
+        ("unknown_count".into(), unknown.to_string()),
+        (
+            "services".into(),
+            services.into_iter().collect::<Vec<_>>().join(","),
+        ),
+        ("compose_project".into(), project.to_string()),
+    ]);
+    metadata.insert("runtime".into(), runtime.to_string());
+
+    if !labels.contains_key("com.docker.compose.project")
+        && !labels.contains_key("io.podman.compose.project")
+    {
+        match runtime {
+            RuntimeKind::Podman => {
+                labels.insert("io.podman.compose.project".into(), project.to_string());
+            }
+            _ => {
+                labels.insert("com.docker.compose.project".into(), project.to_string());
+            }
+        }
+    }
+
+    ResourceRecord {
+        id: format!("compose:{runtime}:{project}"),
+        kind: ResourceKind::ComposeStack,
+        runtime,
+        project: Some(project.to_string()),
+        name: format!("{project} stack"),
+        state,
+        runtime_status: Some(format!("{healthy}/{total} healthy")),
+        ports,
+        labels,
+        urls,
+        metadata,
+        last_changed: latest_change,
+    }
+}
+
+fn compose_stack_state(
+    healthy: usize,
+    starting: usize,
+    degraded: usize,
+    crashed: usize,
+    stopped: usize,
+    unknown: usize,
+) -> HealthState {
+    let total = healthy + starting + degraded + crashed + stopped + unknown;
+    if total == 0 {
+        HealthState::Unknown
+    } else if crashed > 0 {
+        HealthState::Crashed
+    } else if degraded > 0 {
+        HealthState::Degraded
+    } else if starting > 0 {
+        HealthState::Starting
+    } else if healthy > 0 {
+        if stopped > 0 || unknown > 0 {
+            HealthState::Degraded
+        } else {
+            HealthState::Healthy
+        }
+    } else if stopped == total {
+        HealthState::Stopped
+    } else {
+        HealthState::Unknown
+    }
+}
+
+#[derive(Debug, Default)]
+struct ComposeProjectDetails {
+    healthy: usize,
+    starting: usize,
+    degraded: usize,
+    crashed: usize,
+    stopped: usize,
+    unknown: usize,
+    running_count: usize,
+    service_count: usize,
+    services: Vec<String>,
+    project_status: Option<String>,
+    config_files: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ComposePsEntry {
+    #[serde(rename = "Name")]
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "Service")]
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(rename = "State")]
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(rename = "Status")]
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ComposeLsEntry {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Status")]
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(rename = "ConfigFiles")]
+    #[serde(default)]
+    config_files: Option<String>,
 }
 
 fn docker_state(state: Option<String>, status: Option<&str>) -> HealthState {
@@ -412,12 +764,15 @@ mod tests {
 
     use super::{
         NerdctlPsItem, PodmanPort, PodmanPorts, PodmanPsItem, collect, collect_docker,
-        collect_nerdctl, collect_podman, container_state_from_strings, docker_client,
-        docker_socket_override, docker_state, nerdctl_record, parse_port_specs, podman_record,
+        collect_nerdctl, collect_podman, compose_stack_record, compose_stack_state,
+        container_state_from_strings, docker_client, docker_socket_override, docker_state,
+        nerdctl_record, parse_port_specs, podman_record, synthesize_compose_stacks,
     };
     use crate::command::{EnvVarGuard, command_overrides, run_command, test_lock, write_script};
     use giggity_core::config::Config;
-    use giggity_core::model::{HealthState, RuntimeKind, guess_local_urls_for_ports};
+    use giggity_core::model::{
+        HealthState, ResourceKind, ResourceRecord, RuntimeKind, guess_local_urls_for_ports,
+    };
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
@@ -599,6 +954,160 @@ mod tests {
 
         let none = guess_local_urls_for_ports(&parse_port_specs("0.0.0.0:2222->22/tcp"));
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn compose_stack_helpers_aggregate_labeled_containers() {
+        let web = ResourceRecord {
+            id: "docker:web".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: Some("app".into()),
+            name: "web".into(),
+            state: HealthState::Healthy,
+            runtime_status: Some("Up".into()),
+            ports: parse_port_specs("0.0.0.0:8080->80/tcp"),
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "app".into())]),
+            urls: guess_local_urls_for_ports(&parse_port_specs("0.0.0.0:8080->80/tcp")),
+            metadata: BTreeMap::new(),
+            last_changed: chrono::Utc::now(),
+        };
+        let worker = ResourceRecord {
+            id: "docker:worker".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: Some("app".into()),
+            name: "worker".into(),
+            state: HealthState::Crashed,
+            runtime_status: Some("Exited (1)".into()),
+            ports: Vec::new(),
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "app".into())]),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: chrono::Utc::now(),
+        };
+
+        let stacks = synthesize_compose_stacks(&[web.clone(), worker.clone()]);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].kind, ResourceKind::ComposeStack);
+        assert_eq!(stacks[0].runtime, RuntimeKind::Docker);
+        assert_eq!(stacks[0].state, HealthState::Crashed);
+        assert_eq!(stacks[0].project.as_deref(), Some("app"));
+        assert_eq!(stacks[0].name, "app stack");
+        assert_eq!(stacks[0].metadata["service_count"], "2");
+        assert!(stacks[0].metadata["services"].contains("web"));
+
+        let direct = compose_stack_record(RuntimeKind::Docker, "app", &[&web, &worker]);
+        assert_eq!(direct.kind, ResourceKind::ComposeStack);
+        assert_eq!(direct.state, HealthState::Crashed);
+    }
+
+    #[test]
+    fn compose_stack_state_covers_mixed_service_outcomes() {
+        assert_eq!(compose_stack_state(0, 0, 0, 0, 0, 0), HealthState::Unknown);
+        assert_eq!(compose_stack_state(2, 0, 0, 0, 0, 0), HealthState::Healthy);
+        assert_eq!(compose_stack_state(0, 1, 0, 0, 0, 0), HealthState::Starting);
+        assert_eq!(compose_stack_state(1, 0, 1, 0, 0, 0), HealthState::Degraded);
+        assert_eq!(compose_stack_state(1, 0, 0, 1, 0, 0), HealthState::Crashed);
+        assert_eq!(compose_stack_state(0, 0, 0, 0, 2, 0), HealthState::Stopped);
+        assert_eq!(compose_stack_state(0, 0, 0, 0, 0, 1), HealthState::Unknown);
+        assert_eq!(compose_stack_state(1, 0, 0, 0, 1, 0), HealthState::Degraded);
+        assert_eq!(compose_stack_state(1, 0, 0, 0, 0, 1), HealthState::Degraded);
+        assert_eq!(compose_stack_state(0, 0, 0, 0, 1, 1), HealthState::Unknown);
+    }
+
+    #[test]
+    fn compose_stack_synthesis_skips_non_container_and_single_member_groups() {
+        let stack_container = ResourceRecord {
+            id: "podman:web".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Podman,
+            project: Some("stack".into()),
+            name: "web".into(),
+            state: HealthState::Starting,
+            runtime_status: Some("Starting".into()),
+            ports: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: chrono::Utc::now(),
+        };
+        let host = ResourceRecord {
+            id: "host:123".into(),
+            kind: ResourceKind::HostProcess,
+            runtime: RuntimeKind::Host,
+            project: Some("stack".into()),
+            name: "host".into(),
+            state: HealthState::Healthy,
+            runtime_status: None,
+            ports: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: chrono::Utc::now(),
+        };
+
+        assert!(synthesize_compose_stacks(&[host]).is_empty());
+        assert!(synthesize_compose_stacks(&[stack_container]).is_empty());
+    }
+
+    #[test]
+    fn compose_stack_record_injects_runtime_specific_project_labels() {
+        let first = ResourceRecord {
+            id: "podman:web".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Podman,
+            project: Some("stack".into()),
+            name: "web".into(),
+            state: HealthState::Stopped,
+            runtime_status: Some("Exited".into()),
+            ports: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: chrono::Utc::now(),
+        };
+        let second = ResourceRecord {
+            name: "worker".into(),
+            state: HealthState::Unknown,
+            ..first.clone()
+        };
+
+        let stack = compose_stack_record(RuntimeKind::Podman, "stack", &[&first, &second]);
+        assert_eq!(stack.labels["io.podman.compose.project"], "stack");
+        assert_eq!(stack.metadata["stopped_count"], "1");
+        assert_eq!(stack.metadata["unknown_count"], "1");
+        assert_eq!(stack.state, HealthState::Unknown);
+    }
+
+    #[test]
+    fn compose_stack_record_tracks_starting_and_degraded_members_and_injects_docker_label() {
+        let first = ResourceRecord {
+            id: "docker:web".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: Some("stack".into()),
+            name: "web".into(),
+            state: HealthState::Starting,
+            runtime_status: Some("Starting".into()),
+            ports: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: chrono::Utc::now(),
+        };
+        let second = ResourceRecord {
+            name: "worker".into(),
+            state: HealthState::Degraded,
+            runtime_status: Some("Unhealthy".into()),
+            ..first.clone()
+        };
+
+        let stack = compose_stack_record(RuntimeKind::Docker, "stack", &[&first, &second]);
+        assert_eq!(stack.labels["com.docker.compose.project"], "stack");
+        assert_eq!(stack.metadata["starting_count"], "1");
+        assert_eq!(stack.metadata["degraded_count"], "1");
+        assert_eq!(stack.state, HealthState::Degraded);
     }
 
     #[tokio::test]

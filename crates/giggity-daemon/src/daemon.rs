@@ -7,7 +7,7 @@ use anyhow::Context;
 use chrono::Utc;
 use giggity_collectors::{CollectionOutput, CollectorProvider, SystemCollector};
 use giggity_core::config::{Config, ProbeKind, ProbeSpec};
-use giggity_core::model::{CollectorWarning, HealthState, ResourceRecord, Snapshot};
+use giggity_core::model::{CollectorWarning, HealthState, ResourceKind, ResourceRecord, Snapshot};
 use giggity_core::protocol::{ActionKind, ClientRequest, RenderFormat, ServerResponse};
 use giggity_core::state::StateEngine;
 use giggity_core::view::{
@@ -276,6 +276,9 @@ async fn handle_request(request: ClientRequest, store: Arc<RwLock<Store>>) -> Se
 
 async fn fetch_logs(resource: &ResourceRecord, lines: usize) -> anyhow::Result<String> {
     let lines = lines.max(10).to_string();
+    if resource.kind == ResourceKind::ComposeStack {
+        return Ok("logs unavailable for compose stack resources".into());
+    }
     match resource.runtime {
         giggity_core::model::RuntimeKind::Docker => {
             run_output(
@@ -319,6 +322,22 @@ async fn fetch_logs(resource: &ResourceRecord, lines: usize) -> anyhow::Result<S
                 args.insert(0, "--user");
             }
             run_output("journalctl", &args).await
+        }
+        giggity_core::model::RuntimeKind::Kubernetes => {
+            let namespace = resource.namespace().unwrap_or("default");
+            run_output(
+                "kubectl",
+                &[
+                    "logs",
+                    "-n",
+                    namespace,
+                    &resource.name,
+                    "--all-containers=true",
+                    "--tail",
+                    &lines,
+                ],
+            )
+            .await
         }
         _ => Ok("logs unavailable for this resource".into()),
     }
@@ -472,6 +491,7 @@ fn expand_template(template: &str, resource: &ResourceRecord) -> String {
                 giggity_core::model::RuntimeKind::Docker => "docker",
                 giggity_core::model::RuntimeKind::Podman => "podman",
                 giggity_core::model::RuntimeKind::Nerdctl => "nerdctl",
+                giggity_core::model::RuntimeKind::Kubernetes => "kubernetes",
                 giggity_core::model::RuntimeKind::Host => "host",
                 giggity_core::model::RuntimeKind::Launchd => "launchd",
                 giggity_core::model::RuntimeKind::Systemd => "systemd",
@@ -519,6 +539,9 @@ fn opener_program() -> &'static str {
 }
 
 async fn restart_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
+    if resource.kind == ResourceKind::ComposeStack {
+        anyhow::bail!("restart is unavailable for compose stack resources");
+    }
     match resource.runtime {
         giggity_core::model::RuntimeKind::Docker => {
             run_status("docker", &["restart", metadata(resource, "container_id")?]).await?;
@@ -560,6 +583,9 @@ async fn restart_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
             let target = format!("gui/{}/{}", current_uid()?, resource.name);
             run_status("launchctl", &["kickstart", "-k", &target]).await?;
         }
+        giggity_core::model::RuntimeKind::Kubernetes => {
+            anyhow::bail!("restart is unavailable for kubernetes pods");
+        }
         giggity_core::model::RuntimeKind::Host => {
             anyhow::bail!("restart is unavailable for ad-hoc host processes");
         }
@@ -568,6 +594,9 @@ async fn restart_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
 }
 
 async fn stop_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
+    if resource.kind == ResourceKind::ComposeStack {
+        anyhow::bail!("stop is unavailable for compose stack resources");
+    }
     match resource.runtime {
         giggity_core::model::RuntimeKind::Docker => {
             run_status("docker", &["stop", metadata(resource, "container_id")?]).await?;
@@ -608,6 +637,21 @@ async fn stop_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
         giggity_core::model::RuntimeKind::Launchd => {
             let target = format!("gui/{}/{}", current_uid()?, resource.name);
             run_status("launchctl", &["bootout", &target]).await?;
+        }
+        giggity_core::model::RuntimeKind::Kubernetes => {
+            let namespace = resource.namespace().unwrap_or("default").to_string();
+            run_status(
+                "kubectl",
+                &[
+                    "delete",
+                    "pod",
+                    "-n",
+                    &namespace,
+                    &resource.name,
+                    "--wait=false",
+                ],
+            )
+            .await?;
         }
         giggity_core::model::RuntimeKind::Host => {
             run_status("kill", &["-TERM", metadata(resource, "pid")?]).await?;
@@ -691,15 +735,25 @@ async fn run_status(program: &str, args: &[&str]) -> anyhow::Result<()> {
 }
 
 fn current_uid() -> anyhow::Result<String> {
-    Ok(std::env::var("UID").unwrap_or_else(|_| nix_like_id()))
+    match std::env::var("UID") {
+        Ok(uid) if !uid.trim().is_empty() => Ok(uid),
+        _ => nix_like_id(),
+    }
 }
 
-fn nix_like_id() -> String {
-    std::process::Command::new(resolve_program("id"))
+fn nix_like_id() -> anyhow::Result<String> {
+    let output = std::process::Command::new(resolve_program("id"))
         .arg("-u")
         .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_else(|_| "0".into())
+        .context("failed to execute 'id -u'")?;
+    if !output.status.success() {
+        anyhow::bail!("id -u exited with {}", output.status);
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if uid.is_empty() {
+        anyhow::bail!("id -u returned an empty uid");
+    }
+    Ok(uid)
 }
 
 fn resolve_program(program: &str) -> PathBuf {
@@ -766,6 +820,7 @@ async fn socket_is_live(socket_path: &Path) -> bool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::path::Path;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
@@ -922,6 +977,45 @@ mod tests {
             runtime: RuntimeKind::Nerdctl,
             metadata: BTreeMap::from([("container_id".into(), "nerd-1".into())]),
             ..docker_resource()
+        }
+    }
+
+    fn kubernetes_resource() -> ResourceRecord {
+        ResourceRecord {
+            id: "kubernetes:dev:api-123".into(),
+            kind: ResourceKind::KubernetesPod,
+            runtime: RuntimeKind::Kubernetes,
+            project: Some("dev".into()),
+            name: "api-123".into(),
+            state: HealthState::Healthy,
+            runtime_status: Some("Running".into()),
+            ports: Vec::new(),
+            labels: BTreeMap::from([("app".into(), "api".into())]),
+            urls: Vec::new(),
+            metadata: BTreeMap::from([("namespace".into(), "dev".into())]),
+            last_changed: Utc::now(),
+        }
+    }
+
+    fn compose_stack_resource() -> ResourceRecord {
+        ResourceRecord {
+            id: "compose:docker:stack".into(),
+            kind: ResourceKind::ComposeStack,
+            runtime: RuntimeKind::Docker,
+            project: Some("stack".into()),
+            name: "stack stack".into(),
+            state: HealthState::Degraded,
+            runtime_status: Some("1/2 healthy".into()),
+            ports: vec![PortBinding {
+                host_ip: None,
+                host_port: 8080,
+                container_port: Some(80),
+                protocol: "tcp".into(),
+            }],
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "stack".into())]),
+            urls: vec!["http://127.0.0.1:8080".parse().expect("url")],
+            metadata: BTreeMap::from([("compose_project".into(), "stack".into())]),
+            last_changed: Utc::now(),
         }
     }
 
@@ -1537,12 +1631,14 @@ mod tests {
         let docker = write_script(dir.path(), "docker", "printf 'docker-log'");
         let podman = write_script(dir.path(), "podman", "printf 'podman-log'");
         let nerdctl = write_script(dir.path(), "nerdctl", "printf 'nerdctl-log'");
+        let kubectl = write_script(dir.path(), "kubectl", "printf 'kube-log'");
         let journalctl = write_script(dir.path(), "journalctl", "printf 'journal-log'");
         {
             let mut overrides = command_overrides().lock().expect("lock");
             overrides.insert("docker".into(), docker);
             overrides.insert("podman".into(), podman);
             overrides.insert("nerdctl".into(), nerdctl);
+            overrides.insert("kubectl".into(), kubectl);
             overrides.insert("journalctl".into(), journalctl);
         }
 
@@ -1563,6 +1659,12 @@ mod tests {
             "nerdctl-log"
         );
         assert_eq!(
+            fetch_logs(&kubernetes_resource(), 5)
+                .await
+                .expect("kubernetes"),
+            "kube-log"
+        );
+        assert_eq!(
             fetch_logs(&systemd_resource("user"), 5)
                 .await
                 .expect("systemd"),
@@ -1573,6 +1675,12 @@ mod tests {
                 .await
                 .expect("systemd system"),
             "journal-log"
+        );
+        assert_eq!(
+            fetch_logs(&compose_stack_resource(), 5)
+                .await
+                .expect("compose stack"),
+            "logs unavailable for compose stack resources"
         );
         reset_overrides();
     }
@@ -1635,6 +1743,7 @@ mod tests {
         let docker = write_script(dir.path(), "docker", "exit 0");
         let podman = write_script(dir.path(), "podman", "exit 0");
         let nerdctl = write_script(dir.path(), "nerdctl", "exit 0");
+        let kubectl = write_script(dir.path(), "kubectl", "exit 0");
         let systemctl = write_script(
             dir.path(),
             "systemctl",
@@ -1650,6 +1759,7 @@ mod tests {
             overrides.insert("docker".into(), docker);
             overrides.insert("podman".into(), podman);
             overrides.insert("nerdctl".into(), nerdctl);
+            overrides.insert("kubectl".into(), kubectl);
             overrides.insert("systemctl".into(), systemctl);
             overrides.insert("launchctl".into(), launchctl);
             overrides.insert("kill".into(), kill);
@@ -1714,6 +1824,20 @@ mod tests {
                 .to_string()
                 .contains("unavailable")
         );
+        assert!(
+            run_action(&ActionKind::Restart, &kubernetes_resource())
+                .await
+                .expect_err("kubernetes restart")
+                .to_string()
+                .contains("unavailable")
+        );
+        assert!(
+            run_action(&ActionKind::Restart, &compose_stack_resource())
+                .await
+                .expect_err("compose restart")
+                .to_string()
+                .contains("compose stack")
+        );
 
         assert!(
             run_action(&ActionKind::Stop, &docker_resource)
@@ -1756,6 +1880,19 @@ mod tests {
                 .await
                 .expect("host stop")
                 .contains("stopped")
+        );
+        assert!(
+            run_action(&ActionKind::Stop, &kubernetes_resource())
+                .await
+                .expect("kubernetes stop")
+                .contains("stopped")
+        );
+        assert!(
+            run_action(&ActionKind::Stop, &compose_stack_resource())
+                .await
+                .expect_err("compose stop")
+                .to_string()
+                .contains("compose stack")
         );
 
         assert!(
@@ -1874,6 +2011,91 @@ mod tests {
             .await
             .expect("stale startup");
         assert!(stale_path.exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_running_uses_default_config_path_when_not_provided() {
+        let _guard = TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock");
+        let dir = tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("home dir");
+        let delayed_path = dir.path().join("default.sock");
+        let _env = giggity_core::test_support::EnvVarGuard::set_many([
+            ("HOME", Some(home.as_os_str().to_os_string())),
+            ("XDG_CONFIG_HOME", None::<OsString>),
+        ]);
+        let default_config_path = Config::default_path();
+        std::fs::create_dir_all(default_config_path.parent().expect("config parent"))
+            .expect("config parent");
+        std::fs::write(
+            &default_config_path,
+            format!(
+                "cache_dir = '{}'\nsocket_path = '{}'\nrefresh_seconds = 1\n[sources]\ndocker = false\npodman = false\nnerdctl = false\nhost_listeners = false\nlaunchd = false\nsystemd = false\n",
+                dir.path().display(),
+                delayed_path.display()
+            ),
+        )
+        .expect("default config");
+
+        let delayed_clone = delayed_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = tokio::fs::write(delayed_clone, b"socket").await;
+        });
+
+        ensure_daemon_running(&delayed_path, None)
+            .await
+            .expect("default-config startup");
+        assert!(delayed_path.exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_running_handles_initial_try_exists_permission_errors() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempdir().expect("tempdir");
+            let config_path = dir.path().join("config.toml");
+            let sealed_dir = dir.path().join("sealed");
+            std::fs::create_dir_all(&sealed_dir).expect("sealed dir");
+            let socket_path = sealed_dir.join("giggity.sock");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "cache_dir = '{}'\nsocket_path = '{}'\nrefresh_seconds = 1\n[sources]\ndocker = false\npodman = false\nnerdctl = false\nhost_listeners = false\nlaunchd = false\nsystemd = false\n",
+                    dir.path().display(),
+                    socket_path.display()
+                ),
+            )
+            .expect("config");
+
+            let mut perms = std::fs::metadata(&sealed_dir)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o000);
+            std::fs::set_permissions(&sealed_dir, perms).expect("seal dir");
+
+            let sealed_dir_clone = sealed_dir.clone();
+            let socket_clone = socket_path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut perms = std::fs::metadata(&sealed_dir_clone)
+                    .expect("metadata")
+                    .permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&sealed_dir_clone, perms).expect("unseal dir");
+                let _ = tokio::fs::write(socket_clone, b"socket").await;
+            });
+
+            ensure_daemon_running(&socket_path, Some(&config_path))
+                .await
+                .expect("permission recovery startup");
+            assert!(socket_path.exists());
+        }
     }
 
     #[tokio::test]
@@ -2016,6 +2238,12 @@ mod tests {
         assert!(expand_template("{runtime}", &docker_resource()).contains("docker"));
         assert!(expand_template("{runtime}", &podman_resource()).contains("podman"));
         assert!(expand_template("{runtime}", &nerdctl_resource()).contains("nerdctl"));
+        let mut kubernetes = host_resource();
+        kubernetes.runtime = RuntimeKind::Kubernetes;
+        kubernetes.kind = ResourceKind::KubernetesPod;
+        kubernetes.project = Some("dev".into());
+        kubernetes.metadata.insert("namespace".into(), "dev".into());
+        assert!(expand_template("{runtime}", &kubernetes).contains("kubernetes"));
         assert!(expand_template("{runtime}", &launchd_resource()).contains("launchd"));
         assert!(expand_template("{runtime}", &systemd_resource("system")).contains("systemd"));
     }
@@ -2033,8 +2261,52 @@ mod tests {
             .lock()
             .expect("lock")
             .insert("id".into(), id);
-        assert_eq!(nix_like_id(), "777");
+        assert_eq!(nix_like_id().expect("nix-like uid"), "777");
         assert!(!current_uid().expect("uid").is_empty());
+        reset_overrides();
+    }
+
+    #[test]
+    fn current_uid_and_nix_like_id_surface_empty_and_failed_id_commands() {
+        let _guard = TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock");
+        reset_overrides();
+        let dir = tempdir().expect("tempdir");
+        let empty = write_script(dir.path(), "id", "printf ''");
+        command_overrides()
+            .lock()
+            .expect("lock")
+            .insert("id".into(), empty);
+        assert!(
+            nix_like_id()
+                .expect_err("empty uid")
+                .to_string()
+                .contains("empty uid")
+        );
+
+        let dir = tempdir().expect("tempdir");
+        let failing = write_script(dir.path(), "id", "exit 7");
+        command_overrides()
+            .lock()
+            .expect("lock")
+            .insert("id".into(), failing);
+        assert!(
+            current_uid()
+                .expect_err("failed id")
+                .to_string()
+                .contains("id -u exited")
+        );
+
+        let _env = giggity_core::test_support::EnvVarGuard::set("UID", "");
+        let dir = tempdir().expect("tempdir");
+        let id = write_script(dir.path(), "id", "printf '901\\n'");
+        command_overrides()
+            .lock()
+            .expect("lock")
+            .insert("id".into(), id);
+        assert_eq!(current_uid().expect("fallback uid"), "901");
         reset_overrides();
     }
 

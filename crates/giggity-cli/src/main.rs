@@ -16,9 +16,6 @@ use giggity_daemon::{DaemonClient, ensure_daemon_running, run_daemon};
 use tokio::process::Command;
 use tracing_subscriber::EnvFilter;
 
-#[cfg(test)]
-mod test_support;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "giggity",
@@ -379,7 +376,7 @@ mod tests {
         load_config, parse_render_format, query_command, render_command, render_snapshot,
         request_snapshot, run_cli,
     };
-    use crate::test_support::EnvVarGuard;
+    use giggity_core::test_support::EnvVarGuard;
 
     #[derive(Debug)]
     struct FakeCollector;

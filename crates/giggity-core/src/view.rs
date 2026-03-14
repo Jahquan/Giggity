@@ -283,6 +283,7 @@ fn resource_allowed_by_sources(
         RuntimeKind::Docker => sources.docker,
         RuntimeKind::Podman => sources.podman,
         RuntimeKind::Nerdctl => sources.nerdctl,
+        RuntimeKind::Kubernetes => sources.kubernetes,
         RuntimeKind::Host => sources.host_listeners,
         RuntimeKind::Launchd => sources.launchd,
         RuntimeKind::Systemd => sources.systemd,
@@ -485,9 +486,29 @@ fn summarize(
         }
     }
 
+    let stack_keys = resources
+        .iter()
+        .filter(|resource| resource.kind == ResourceKind::ComposeStack)
+        .filter_map(|resource| {
+            resource
+                .project
+                .as_ref()
+                .map(|project| (resource.runtime, project.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+
     summary.issues = resources
         .iter()
         .filter(|resource| resource.state.is_issue())
+        .filter(|resource| {
+            if resource.kind != ResourceKind::Container {
+                return true;
+            }
+            match resource.compose_project() {
+                Some(project) => !stack_keys.contains(&(resource.runtime, project.to_string())),
+                None => true,
+            }
+        })
         .map(ResourceRecord::summary_name)
         .take(view.status_bar.max_issue_names)
         .collect();
@@ -505,11 +526,13 @@ fn group_resources(resources: &[ResourceRecord], grouping: &GroupBy) -> Vec<Grou
                 .project
                 .clone()
                 .unwrap_or_else(|| "ungrouped".into()),
+            GroupBy::Namespace => resource
+                .namespace()
+                .map(str::to_owned)
+                .unwrap_or_else(|| "ungrouped".into()),
             GroupBy::ComposeStack => resource
-                .labels
-                .get("com.docker.compose.project")
-                .cloned()
-                .or_else(|| resource.project.clone())
+                .compose_project()
+                .map(str::to_owned)
                 .unwrap_or_else(|| "ungrouped".into()),
             GroupBy::UnitDomain => resource
                 .metadata
@@ -771,6 +794,85 @@ mod tests {
     }
 
     #[test]
+    fn issue_summary_prefers_compose_stack_over_member_container_entries() {
+        let mut config = Config::default();
+        let mut view = config.active_view(None);
+        view.status_bar.max_issue_names = 5;
+        config.views.insert("default".into(), view);
+
+        let stack = ResourceRecord {
+            id: "compose:docker:stack".into(),
+            kind: ResourceKind::ComposeStack,
+            runtime: RuntimeKind::Docker,
+            project: Some("stack".into()),
+            name: "stack stack".into(),
+            state: HealthState::Crashed,
+            runtime_status: Some("1/2 healthy".into()),
+            ports: vec![PortBinding {
+                host_ip: None,
+                host_port: 8080,
+                container_port: Some(80),
+                protocol: "tcp".into(),
+            }],
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "stack".into())]),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 10).unwrap(),
+        };
+        let web = ResourceRecord {
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: Some("stack".into()),
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "stack".into())]),
+            ..resource("web", HealthState::Crashed, RuntimeKind::Docker)
+        };
+        let standalone = resource("standalone", HealthState::Degraded, RuntimeKind::Host);
+        let snapshot = Snapshot {
+            resources: vec![web, stack, standalone],
+            ..Snapshot::default()
+        };
+
+        let resolved = resolve_view(&config, None, &snapshot);
+        assert_eq!(
+            resolved.summary.issues,
+            vec![
+                "stack stack:8080".to_string(),
+                "proj/standalone:3000".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_summary_keeps_issue_containers_without_compose_project() {
+        let mut config = Config::default();
+        let mut view = config.active_view(None);
+        view.status_bar.max_issue_names = 5;
+        config.views.insert("default".into(), view);
+
+        let standalone_container = ResourceRecord {
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: None,
+            labels: BTreeMap::new(),
+            name: "standalone".into(),
+            ports: vec![PortBinding {
+                host_ip: None,
+                host_port: 8081,
+                container_port: Some(80),
+                protocol: "tcp".into(),
+            }],
+            ..resource("standalone", HealthState::Crashed, RuntimeKind::Docker)
+        };
+        let snapshot = Snapshot {
+            resources: vec![standalone_container],
+            ..Snapshot::default()
+        };
+
+        let resolved = resolve_view(&config, None, &snapshot);
+        assert_eq!(resolved.summary.issues, vec!["standalone:8081".to_string()]);
+    }
+
+    #[test]
     fn resolve_view_applies_name_based_severity_overrides() {
         let mut config = Config::default();
         let mut view = ViewConfig::default();
@@ -896,6 +998,7 @@ mod tests {
         config.sources.docker = false;
         config.sources.podman = false;
         config.sources.nerdctl = false;
+        config.sources.kubernetes = false;
         config.sources.host_listeners = false;
         config.sources.launchd = true;
         config.sources.systemd = true;
@@ -942,6 +1045,7 @@ mod tests {
                     docker: true,
                     podman: false,
                     nerdctl: false,
+                    kubernetes: false,
                     host_listeners: false,
                     launchd: false,
                     systemd: false,
@@ -1022,6 +1126,15 @@ mod tests {
             last_changed: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 2).unwrap(),
             ..resource("api", HealthState::Degraded, RuntimeKind::Host)
         };
+        let kubernetes = ResourceRecord {
+            kind: ResourceKind::KubernetesPod,
+            runtime: RuntimeKind::Kubernetes,
+            project: Some("dev".into()),
+            state: HealthState::Healthy,
+            metadata: BTreeMap::from([("namespace".into(), "dev".into())]),
+            last_changed: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 6).unwrap(),
+            ..resource("pod-1", HealthState::Healthy, RuntimeKind::Kubernetes)
+        };
         let launchd = ResourceRecord {
             kind: ResourceKind::LaunchdUnit,
             runtime: RuntimeKind::Launchd,
@@ -1042,7 +1155,7 @@ mod tests {
             ..resource("mystery", HealthState::Unknown, RuntimeKind::Podman)
         };
         let snapshot = Snapshot {
-            resources: vec![host, docker, launchd, stopped, unknown],
+            resources: vec![host, docker, kubernetes, launchd, stopped, unknown],
             warnings: vec![
                 crate::model::CollectorWarning {
                     source: "podman".into(),
@@ -1072,7 +1185,8 @@ mod tests {
             config.views.insert("default".into(), view.clone());
             let resolved = resolve_view(&config, None, &snapshot);
             assert_eq!(resolved.resources.first().expect("first").name, "api");
-            assert_eq!(resolved.summary.total, 5);
+            assert_eq!(resolved.summary.total, 6);
+            assert_eq!(resolved.summary.healthy, 1);
             assert_eq!(resolved.summary.starting, 1);
             assert_eq!(resolved.summary.degraded, 1);
             assert_eq!(resolved.summary.crashed, 1);
@@ -1085,7 +1199,7 @@ mod tests {
             );
             assert_eq!(
                 resolved.summary.latest_change,
-                Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 5).unwrap())
+                Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 6).unwrap())
             );
         }
 
@@ -1093,6 +1207,7 @@ mod tests {
             GroupBy::Severity,
             GroupBy::Runtime,
             GroupBy::Project,
+            GroupBy::Namespace,
             GroupBy::ComposeStack,
             GroupBy::UnitDomain,
             GroupBy::None,

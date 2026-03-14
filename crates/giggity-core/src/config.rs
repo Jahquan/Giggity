@@ -53,6 +53,8 @@ pub struct SourceToggles {
     #[serde(default = "default_true")]
     pub nerdctl: bool,
     #[serde(default = "default_true")]
+    pub kubernetes: bool,
+    #[serde(default = "default_true")]
     pub host_listeners: bool,
     #[serde(default = "default_true")]
     pub launchd: bool,
@@ -99,6 +101,7 @@ pub enum GroupBy {
     Severity,
     Runtime,
     Project,
+    Namespace,
     ComposeStack,
     UnitDomain,
     None,
@@ -276,6 +279,7 @@ impl Default for SourceToggles {
             docker: true,
             podman: true,
             nerdctl: true,
+            kubernetes: true,
             host_listeners: true,
             launchd: cfg!(target_os = "macos"),
             systemd: cfg!(target_os = "linux"),
@@ -436,6 +440,9 @@ impl Config {
                 "docker_enabled" => self.sources.docker = parse_bool(value, self.sources.docker),
                 "podman_enabled" => self.sources.podman = parse_bool(value, self.sources.podman),
                 "nerdctl_enabled" => self.sources.nerdctl = parse_bool(value, self.sources.nerdctl),
+                "kubernetes_enabled" => {
+                    self.sources.kubernetes = parse_bool(value, self.sources.kubernetes)
+                }
                 "host_enabled" => {
                     self.sources.host_listeners = parse_bool(value, self.sources.host_listeners)
                 }
@@ -708,6 +715,7 @@ template = "ops {total}"
         let mut config = Config::default();
         config.merge_tmux_overrides(&TmuxOverrides::from(BTreeMap::from([
             ("docker_enabled".into(), "off".into()),
+            ("kubernetes_enabled".into(), "off".into()),
             ("host_enabled".into(), "no".into()),
             ("hide_patterns".into(), "^foo,^bar".into()),
             ("max_issue_names".into(), "5".into()),
@@ -716,6 +724,7 @@ template = "ops {total}"
         ])));
 
         assert!(!config.sources.docker);
+        assert!(!config.sources.kubernetes);
         assert!(!config.sources.host_listeners);
         assert_eq!(config.active_view(None).hide, vec!["^foo", "^bar"]);
         assert_eq!(config.active_view(None).status_bar.max_issue_names, 5);
@@ -761,6 +770,7 @@ template = "ops {total}"
             ("docker_enabled".into(), "maybe".into()),
             ("podman_enabled".into(), "yes".into()),
             ("nerdctl_enabled".into(), "0".into()),
+            ("kubernetes_enabled".into(), "1".into()),
             ("launchd_enabled".into(), "true".into()),
             ("systemd_enabled".into(), "false".into()),
         ])));
@@ -770,6 +780,7 @@ template = "ops {total}"
         assert!(config.sources.docker);
         assert!(config.sources.podman);
         assert!(!config.sources.nerdctl);
+        assert!(config.sources.kubernetes);
         assert!(config.sources.launchd);
         assert!(!config.sources.systemd);
     }
@@ -780,6 +791,7 @@ template = "ops {total}"
         assert!(toggles.docker);
         assert!(toggles.podman);
         assert!(toggles.nerdctl);
+        assert!(toggles.kubernetes);
         assert!(toggles.host_listeners);
         assert!(toggles.launchd);
         assert!(toggles.systemd);
@@ -849,6 +861,7 @@ default_view = "ops"
             ("startup_grace_seconds".into(), "9".into()),
             ("podman_enabled".into(), "false".into()),
             ("nerdctl_enabled".into(), "off".into()),
+            ("kubernetes_enabled".into(), "no".into()),
             ("host_enabled".into(), "true".into()),
             ("launchd_enabled".into(), "1".into()),
             ("systemd_enabled".into(), "yes".into()),
@@ -866,6 +879,7 @@ default_view = "ops"
         assert_eq!(config.active_view(None), ViewConfig::default());
         assert!(!config.sources.podman);
         assert!(!config.sources.nerdctl);
+        assert!(!config.sources.kubernetes);
         assert!(config.sources.host_listeners);
         assert!(config.sources.launchd);
         assert!(config.sources.systemd);

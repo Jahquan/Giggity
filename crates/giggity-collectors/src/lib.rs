@@ -6,6 +6,7 @@ use giggity_core::model::{CollectorWarning, ResourceRecord};
 mod command;
 pub mod containers;
 pub mod host;
+pub mod kubernetes;
 pub mod service_managers;
 
 #[derive(Debug, Default, Clone)]
@@ -34,6 +35,7 @@ impl CollectorProvider for SystemCollector {
     async fn collect(&self, config: &Config) -> Result<CollectionOutput> {
         let mut output = CollectionOutput::default();
         output.merge(containers::collect(config).await);
+        output.merge(kubernetes::collect(config).await);
         output.merge(host::collect(config).await);
         output.merge(service_managers::collect(config).await);
         Ok(output)
@@ -70,6 +72,7 @@ mod tests {
         config.sources.docker = false;
         config.sources.podman = false;
         config.sources.nerdctl = false;
+        config.sources.kubernetes = false;
         config.sources.host_listeners = false;
         config.sources.launchd = false;
         config.sources.systemd = false;

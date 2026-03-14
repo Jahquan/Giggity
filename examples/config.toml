@@ -7,6 +7,7 @@ default_view = "default"
 docker = true
 podman = true
 nerdctl = true
+kubernetes = true
 host_listeners = true
 launchd = true
 systemd = true
@@ -16,6 +17,18 @@ grouping = "severity"
 sorting = "severity"
 hide = ["^com\\.apple\\."]
 pinned = ["docker:web", "docker:db"]
+
+[views.ops]
+grouping = "compose_stack"
+sorting = "severity"
+include = [
+  { kind = ["compose_stack", "kubernetes_pod"], state = ["starting", "degraded", "crashed"] },
+]
+
+[views.kube]
+grouping = "namespace"
+sorting = "name"
+include = [{ runtime = ["kubernetes"] }]
 
 [views.default.status_bar]
 template = "svc {total} ok {healthy} warn {degraded} down {crashed} stop {stopped} src {collector_warnings} [{issues}]"

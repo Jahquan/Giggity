@@ -2,7 +2,7 @@
 
 Giggity is a Rust-first tmux dashboard for developers who run a lot of local services and containers.
 
-It keeps a system-wide snapshot of what is running on the machine, renders a compact tmux status segment, and provides an interactive popup for inspection and operator actions. The current release is V1: Docker, Podman, nerdctl, host listeners, `launchd`, and `systemd` are supported today.
+It keeps a system-wide snapshot of what is running on the machine, renders a compact tmux status segment, and provides an interactive popup for inspection and operator actions. The current release is V2: Docker, Podman, nerdctl, Kubernetes pods, compose-stack resources, richer host listener names, `launchd`, and `systemd` are supported today.
 
 ## What Giggity Does
 
@@ -11,6 +11,8 @@ Giggity continuously inventories developer-facing workloads across the machine a
 - containers from Docker
 - containers from Podman
 - containers from nerdctl / containerd-backed local setups
+- Kubernetes pods from the current `kubectl` context
+- synthetic compose-stack resources aggregated from labeled containers
 - host processes that are actively listening on TCP ports
 - `launchd` jobs on macOS
 - `systemd` units on Linux
@@ -41,6 +43,7 @@ Current runtimes:
 - Docker via the Docker API
 - Podman via `podman ps --all --format json`
 - nerdctl via `nerdctl ps -a --format '{{json .}}'`
+- Kubernetes via `kubectl get pods --all-namespaces -o json`
 
 Giggity understands:
 
@@ -51,6 +54,8 @@ Giggity understands:
 - published ports
 - Compose project labels when the runtime exposes them
 - namespace metadata from nerdctl when available
+- Kubernetes pod phases and container waiting / termination reasons
+- compose-stack rollups synthesized across multi-service projects
 
 ### Host service discovery
 
@@ -66,6 +71,42 @@ This covers the common local-service case where a developer has:
 - a Python dev server on `:8000`
 - a Node app on `:3000`
 - a background worker exposing an admin port
+
+When a PID is available, Giggity enriches the display name with the full process command line from `ps`, so the dashboard can show `node server.js` or `python manage.py runserver` instead of five rows all named `node` or `python`.
+
+### Kubernetes visibility
+
+Giggity V2 adds Kubernetes pod collection through the current `kubectl` context.
+
+Today that includes:
+
+- pod name
+- namespace
+- phase
+- restart counts
+- waiting / termination reasons
+- optional host ports when declared
+
+The Kubernetes collector is intentionally pod-focused in V2. It does not yet model deployments, services, or rollouts as first-class resources.
+
+### Compose stack resources
+
+Giggity V2 also synthesizes stack-level resources for multi-service compose projects.
+
+That means a compose app can now appear twice in useful ways:
+
+- as its underlying container resources
+- as a single stack rollup resource such as `myapp stack`
+
+Stack resources aggregate:
+
+- overall health
+- service counts
+- service names
+- published ports
+- compose project identity
+
+Issue summaries prefer the stack rollup over every individual compose member so the tmux segment stays compact.
 
 ### Service manager visibility
 
@@ -181,6 +222,8 @@ The codebase is a Cargo workspace with four crates:
   - view resolution and rendering
 - `giggity-collectors`
   - Docker / Podman / nerdctl collection
+  - Kubernetes pod collection
+  - compose-stack synthesis
   - host listener collection
   - `launchd` / `systemd` collection
 - `giggity-daemon`
@@ -304,6 +347,13 @@ giggity install-service --activate
 | Docker | Docker API via `bollard` | Supports local Docker Engine / Docker Desktop sockets |
 | Podman | `podman ps --all --format json` | Uses the Podman CLI already on `PATH` |
 | nerdctl | `nerdctl ps -a --format '{{json .}}'` | Works with containerd-based local setups |
+| Kubernetes | `kubectl get pods --all-namespaces -o json` | Uses the current `kubectl` context and models pods as resources |
+
+### Synthetic resources
+
+| Resource | How Giggity Builds It | Notes |
+|---|---|---|
+| Compose stack | Aggregated from compose-labeled container resources | Only emitted for projects with more than one member container |
 
 ### Host and service managers
 
@@ -315,13 +365,17 @@ giggity install-service --activate
 
 ### Current scope boundary
 
-V1 does not yet include:
+V2 includes:
 
-- Kubernetes collection
-- Compose stack-level synthetic resources
-- richer host process command-name enrichment beyond the current listener naming
+- Kubernetes pod collection
+- compose stack synthetic resources
+- richer host process command-name enrichment
 
-Those are valid next-step features, but they are not claimed as current functionality here.
+Still out of scope in V2:
+
+- Kubernetes services, deployments, and rollout objects as first-class resources
+- compose stack mutating actions
+- richer host process ancestry / process-tree grouping
 
 ## CLI Reference
 
@@ -459,6 +513,7 @@ The `sources` table controls which collectors run:
 docker = true
 podman = true
 nerdctl = true
+kubernetes = true
 host_listeners = true
 launchd = true
 systemd = true
@@ -516,6 +571,7 @@ Supported grouping modes:
 - `severity`
 - `runtime`
 - `project`
+- `namespace`
 - `compose_stack`
 - `unit_domain`
 - `none`
@@ -580,10 +636,10 @@ Example:
 
 ```toml
 [views.ops]
-grouping = "runtime"
+grouping = "compose_stack"
 
 [[views.ops.include]]
-runtime = ["docker", "podman"]
+kind = ["compose_stack", "kubernetes_pod"]
 state = ["degraded", "crashed", "starting"]
 
 [[views.ops.exclude]]
@@ -677,6 +733,7 @@ The shell wrappers read these tmux globals:
 - `@giggity_docker_enabled`
 - `@giggity_podman_enabled`
 - `@giggity_nerdctl_enabled`
+- `@giggity_kubernetes_enabled`
 - `@giggity_host_enabled`
 - `@giggity_launchd_enabled`
 - `@giggity_systemd_enabled`
@@ -689,6 +746,7 @@ set -g @giggity_template 'svc {total} down {crashed} [{issues}]'
 set -g @giggity_hide_patterns '^com\.apple\.,^port-'
 set -g @giggity_max_issue_names 5
 set -g @giggity_podman_enabled off
+set -g @giggity_kubernetes_enabled on
 ```
 
 These overrides are intentionally scoped to a focused subset of the config surface so tmux remains simple.
@@ -711,12 +769,25 @@ Current log behavior:
 - Docker: `docker logs --tail`
 - Podman: `podman logs --tail`
 - nerdctl: `nerdctl logs --tail`
+- Kubernetes: `kubectl logs -n <namespace> <pod> --all-containers=true --tail`
 - `systemd`: `journalctl -n --no-pager -u ...`
+- compose-stack resources: logs unavailable
 - other resource types: logs unavailable
 
 ### Restart / stop
 
-Current action support is runtime-specific and intentionally conservative. Unsupported targets return safe errors instead of pretending the action succeeded.
+Current action support is runtime-specific and intentionally conservative.
+
+Today that means:
+
+- Docker / Podman / nerdctl containers support restart and stop
+- `systemd` and `launchd` units support restart and stop
+- ad-hoc host listeners support stop via `kill -TERM`
+- Kubernetes pods support stop via `kubectl delete pod ... --wait=false`
+- Kubernetes pods do not support restart as a first-class action in V2
+- compose-stack resources do not support restart / stop actions in V2
+
+Unsupported targets return safe errors instead of pretending the action succeeded.
 
 ### Open URL
 
@@ -866,18 +937,25 @@ That usually means the underlying runtime action failed, not the popup itself. C
 
 ## Roadmap
 
-Current V1 scope is intentionally focused on:
+Current V2 scope is intentionally focused on:
 
 - local container runtimes
 - host listeners
 - OS service managers
 - tmux rendering and popup inspection
 
-Likely next high-value additions after V1:
+Current V2 ships the biggest next-step additions already:
 
-- Kubernetes collection
+- Kubernetes pod collection
 - richer host command-name enrichment
-- compose stack-level synthetic resources and actions
+- compose stack-level synthetic resources
+
+Likely next high-value additions after V2:
+
+- Kubernetes services / deployments / rollout awareness
+- compose stack-level mutating actions
+- live event streaming from Docker / Podman / Kubernetes
+- richer host process ancestry and dependency views
 
 Those are roadmap items, not current documented behavior.
 

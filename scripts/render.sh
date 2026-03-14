@@ -24,7 +24,7 @@ for key in refresh_seconds startup_grace_seconds max_issue_names template hide_p
 	fi
 done
 
-for key in docker_enabled podman_enabled nerdctl_enabled host_enabled launchd_enabled systemd_enabled; do
+for key in docker_enabled podman_enabled nerdctl_enabled kubernetes_enabled host_enabled launchd_enabled systemd_enabled; do
 	value="$(tmux_opt "@giggity_${key}")"
 	if [[ -n "$value" ]]; then
 		args+=(--tmux-option "${key}=${value}")

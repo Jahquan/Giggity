@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::LazyLock;
 
 use giggity_core::config::Config;
 use giggity_core::model::{
@@ -9,6 +11,18 @@ use regex::Regex;
 
 use crate::CollectionOutput;
 use crate::command::run_command;
+
+static SS_LISTEN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"LISTEN.+?(?P<local>\S+:\d+)\s+\S+\s+users:\(\("(?P<command>[^"]+)",pid=(?P<pid>\d+),fd=\d+\)\)"#,
+    )
+    .expect("valid ss regex")
+});
+
+static NETSTAT_LISTEN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^tcp\d?\s+\d+\s+\d+\s+\S+\.(?P<port>\d+)\s+\S+\s+LISTEN")
+        .expect("valid netstat regex")
+});
 
 pub async fn collect(config: &Config) -> CollectionOutput {
     if !config.sources.host_listeners {
@@ -28,14 +42,20 @@ pub async fn collect(config: &Config) -> CollectionOutput {
 
 async fn collect_host_processes() -> anyhow::Result<Vec<ResourceRecord>> {
     if let Ok(output) = run_command("host", "lsof", &["-nP", "-iTCP", "-sTCP:LISTEN"]).await {
-        return Ok(parse_lsof_listeners(&output));
+        let mut resources = parse_lsof_listeners(&output);
+        enrich_host_processes(&mut resources).await;
+        return Ok(resources);
     }
     #[cfg(target_os = "linux")]
     if let Some(output) = collect_from_ss().await? {
-        return Ok(parse_ss_listeners(&output));
+        let mut resources = parse_ss_listeners(&output);
+        enrich_host_processes(&mut resources).await;
+        return Ok(resources);
     }
     let output = run_command("host", "netstat", &["-anv", "-p", "tcp"]).await?;
-    Ok(parse_netstat_listeners(&output))
+    let mut resources = parse_netstat_listeners(&output);
+    enrich_host_processes(&mut resources).await;
+    Ok(resources)
 }
 
 #[cfg(target_os = "linux")]
@@ -83,7 +103,7 @@ pub fn parse_lsof_listeners(output: &str) -> Vec<ResourceRecord> {
             container_port: None,
             protocol: "tcp".into(),
         });
-        if let Some(url) = guess_host_url(port) {
+        if let Some(url) = guess_local_url(port) {
             entry.urls.push(url);
         }
     }
@@ -92,12 +112,9 @@ pub fn parse_lsof_listeners(output: &str) -> Vec<ResourceRecord> {
 }
 
 pub fn parse_ss_listeners(output: &str) -> Vec<ResourceRecord> {
-    let regex =
-        Regex::new(r#"LISTEN.+?(?P<local>\S+:\d+)\s+\S+\s+users:\(\("(?P<command>[^"]+)",pid=(?P<pid>\d+),fd=\d+\)\)"#)
-            .expect("valid ss regex");
     let mut grouped: BTreeMap<String, ResourceRecord> = BTreeMap::new();
     for line in output.lines() {
-        let Some(captures) = regex.captures(line) else {
+        let Some(captures) = SS_LISTEN_REGEX.captures(line) else {
             continue;
         };
         let pid = captures["pid"].to_string();
@@ -125,7 +142,7 @@ pub fn parse_ss_listeners(output: &str) -> Vec<ResourceRecord> {
             container_port: None,
             protocol: "tcp".into(),
         });
-        if let Some(url) = guess_host_url(port) {
+        if let Some(url) = guess_local_url(port) {
             entry.urls.push(url);
         }
     }
@@ -133,15 +150,13 @@ pub fn parse_ss_listeners(output: &str) -> Vec<ResourceRecord> {
 }
 
 pub fn parse_netstat_listeners(output: &str) -> Vec<ResourceRecord> {
-    let regex = Regex::new(r"^tcp\d?\s+\d+\s+\d+\s+\S+\.(?P<port>\d+)\s+\S+\s+LISTEN")
-        .expect("valid netstat regex");
     output
         .lines()
         .enumerate()
         .filter_map(|(idx, line)| {
-            let captures = regex.captures(line)?;
+            let captures = NETSTAT_LISTEN_REGEX.captures(line)?;
             let port = captures["port"].parse().ok()?;
-            let urls = guess_host_url(port).into_iter().collect();
+            let urls = guess_local_url(port).into_iter().collect();
             Some(ResourceRecord {
                 id: format!("host:port:{port}:{idx}"),
                 kind: ResourceKind::HostProcess,
@@ -165,20 +180,90 @@ pub fn parse_netstat_listeners(output: &str) -> Vec<ResourceRecord> {
         .collect()
 }
 
-fn capture_port(address: &str) -> Option<u16> {
-    address.rsplit(':').next()?.parse().ok()
+async fn enrich_host_processes(resources: &mut [ResourceRecord]) {
+    let pids = resources
+        .iter()
+        .filter_map(|resource| resource.metadata.get("pid").cloned())
+        .collect::<Vec<_>>();
+    if pids.is_empty() {
+        return;
+    }
+
+    let Ok(commands) = process_commands(&pids).await else {
+        return;
+    };
+
+    for resource in resources {
+        let Some(pid) = resource.metadata.get("pid") else {
+            continue;
+        };
+        let Some(command) = commands.get(pid) else {
+            continue;
+        };
+        resource.metadata.insert("command".into(), command.clone());
+        if let Some(display) = display_host_command(command) {
+            resource.name = display;
+        }
+    }
 }
 
-fn guess_host_url(port: u16) -> Option<url::Url> {
-    guess_local_url(port)
+async fn process_commands(pids: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let selection = pids.join(",");
+    let output = run_command(
+        "host",
+        "ps",
+        &["-ww", "-o", "pid=", "-o", "command=", "-p", &selection],
+    )
+    .await?;
+    Ok(parse_ps_commands(&output))
+}
+
+pub fn parse_ps_commands(output: &str) -> BTreeMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let split_at = trimmed.find(char::is_whitespace)?;
+            let pid = trimmed[..split_at].trim();
+            let command = trimmed[split_at..].trim();
+            if pid.is_empty() || command.is_empty() {
+                return None;
+            }
+            Some((pid.to_string(), command.to_string()))
+        })
+        .collect()
+}
+
+pub fn display_host_command(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let program = parts.next()?;
+    let executable = Path::new(program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(program);
+    let args = parts.collect::<Vec<_>>().join(" ");
+    Some(if args.is_empty() {
+        executable.to_string()
+    } else {
+        format!("{executable} {args}")
+    })
+}
+
+fn capture_port(address: &str) -> Option<u16> {
+    address.rsplit(':').next()?.parse().ok()
 }
 
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::{
-        collect, collect_host_processes, parse_lsof_listeners, parse_netstat_listeners,
-        parse_ss_listeners,
+        collect, collect_host_processes, display_host_command, enrich_host_processes,
+        parse_lsof_listeners, parse_netstat_listeners, parse_ps_commands, parse_ss_listeners,
     };
     use crate::command::{command_overrides, run_command, test_lock, write_script};
     use giggity_core::config::Config;
@@ -255,6 +340,83 @@ mod tests {
         assert_eq!(parsed[0].urls[0].as_str(), "https://127.0.0.1:8443/");
     }
 
+    #[test]
+    fn parses_ps_output_and_normalizes_host_command_names() {
+        let parsed = parse_ps_commands(
+            "  123 /nix/store/node/bin/node server.js --port 3000\n  777 python3 -m http.server\n",
+        );
+        assert_eq!(
+            parsed["123"],
+            "/nix/store/node/bin/node server.js --port 3000"
+        );
+        assert_eq!(
+            display_host_command(parsed["123"].as_str()).as_deref(),
+            Some("node server.js --port 3000")
+        );
+        assert_eq!(
+            display_host_command(parsed["777"].as_str()).as_deref(),
+            Some("python3 -m http.server")
+        );
+        assert_eq!(
+            display_host_command("/usr/local/bin/postgres").as_deref(),
+            Some("postgres")
+        );
+        assert!(display_host_command("   ").is_none());
+        assert!(parse_ps_commands("  123\n  456   \n  onlytext\n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn enrich_host_processes_handles_failed_and_partial_ps_output() {
+        let _guard = test_lock().lock().expect("lock");
+        reset_overrides();
+        let dir = tempdir().expect("tempdir");
+        let ps_fail = write_script(dir.path(), "ps", "echo nope >&2; exit 1");
+        command_overrides()
+            .lock()
+            .expect("lock")
+            .insert("ps".into(), ps_fail);
+
+        let mut resources = parse_lsof_listeners(
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\npython 123 q 4u IPv4 0x 0t0 TCP *:8080 (LISTEN)\n",
+        );
+        enrich_host_processes(&mut resources).await;
+        assert_eq!(resources[0].name, "python");
+        assert!(!resources[0].metadata.contains_key("command"));
+
+        let dir = tempdir().expect("tempdir");
+        let ps_partial = write_script(dir.path(), "ps", "printf '  999 /usr/bin/ignored\\n'");
+        command_overrides()
+            .lock()
+            .expect("lock")
+            .insert("ps".into(), ps_partial);
+        let mut resources = parse_lsof_listeners(
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\npython 123 q 4u IPv4 0x 0t0 TCP *:8080 (LISTEN)\n",
+        );
+        resources.push(giggity_core::model::ResourceRecord {
+            id: "host:port:3000:1".into(),
+            kind: giggity_core::model::ResourceKind::HostProcess,
+            runtime: giggity_core::model::RuntimeKind::Host,
+            project: None,
+            name: "port-3000".into(),
+            state: giggity_core::model::HealthState::Healthy,
+            runtime_status: Some("listening".into()),
+            ports: vec![giggity_core::model::PortBinding {
+                host_ip: None,
+                host_port: 3000,
+                container_port: None,
+                protocol: "tcp".into(),
+            }],
+            labels: std::collections::BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            last_changed: chrono::Utc::now(),
+        });
+        enrich_host_processes(&mut resources).await;
+        assert_eq!(resources[0].name, "python");
+        assert_eq!(resources[1].name, "port-3000");
+        reset_overrides();
+    }
+
     #[tokio::test]
     async fn run_command_and_collection_use_overrides() {
         let _guard = test_lock().lock().expect("lock");
@@ -265,10 +427,19 @@ mod tests {
             "lsof",
             "printf 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\npython 123 q 4u IPv4 0x 0t0 TCP *:8080 (LISTEN)\n'",
         );
+        let ps = write_script(
+            dir.path(),
+            "ps",
+            "printf '  123 /usr/bin/python3 manage.py runserver 0.0.0.0:8080\n'",
+        );
         command_overrides()
             .lock()
             .expect("lock")
             .insert("lsof".into(), lsof);
+        command_overrides()
+            .lock()
+            .expect("lock")
+            .insert("ps".into(), ps);
 
         let ok = run_command("host", "lsof", &["-nP"]).await.expect("stdout");
         assert!(ok.contains("python"));
@@ -277,7 +448,14 @@ mod tests {
         config.sources.host_listeners = true;
         let collected = collect(&config).await;
         assert!(collected.warnings.is_empty());
-        assert_eq!(collected.resources[0].name, "python");
+        assert_eq!(
+            collected.resources[0].name,
+            "python3 manage.py runserver 0.0.0.0:8080"
+        );
+        assert_eq!(
+            collected.resources[0].metadata["command"],
+            "/usr/bin/python3 manage.py runserver 0.0.0.0:8080"
+        );
         reset_overrides();
     }
 
@@ -292,10 +470,12 @@ mod tests {
             "netstat",
             "printf 'tcp4 0 0 *.3000 *.* LISTEN\n'",
         );
+        let ps = write_script(dir.path(), "ps", "echo nope >&2; exit 1");
         {
             let mut overrides = command_overrides().lock().expect("lock");
             overrides.insert("lsof".into(), lsof);
             overrides.insert("netstat".into(), netstat);
+            overrides.insert("ps".into(), ps);
         }
 
         let resources = collect_host_processes().await.expect("fallback");
