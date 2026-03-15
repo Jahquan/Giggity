@@ -116,6 +116,7 @@ fn pod_record(item: KubernetesPodItem, context: &str) -> ResourceRecord {
         urls,
         metadata,
         last_changed: chrono::Utc::now(),
+        state_since: chrono::Utc::now(),
     }
 }
 

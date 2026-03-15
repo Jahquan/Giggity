@@ -78,6 +78,7 @@ pub enum ResourceKind {
     HostProcess,
     KubernetesPod,
     LaunchdUnit,
+    Probe,
     SystemdUnit,
 }
 
@@ -89,6 +90,7 @@ impl Display for ResourceKind {
             ResourceKind::HostProcess => "host_process",
             ResourceKind::KubernetesPod => "kubernetes_pod",
             ResourceKind::LaunchdUnit => "launchd_unit",
+            ResourceKind::Probe => "probe",
             ResourceKind::SystemdUnit => "systemd_unit",
         };
         f.write_str(text)
@@ -104,6 +106,7 @@ pub enum RuntimeKind {
     Kubernetes,
     Host,
     Launchd,
+    Probes,
     Systemd,
 }
 
@@ -116,6 +119,7 @@ impl Display for RuntimeKind {
             RuntimeKind::Kubernetes => "kubernetes",
             RuntimeKind::Host => "host",
             RuntimeKind::Launchd => "launchd",
+            RuntimeKind::Probes => "probes",
             RuntimeKind::Systemd => "systemd",
         };
         f.write_str(text)
@@ -153,6 +157,8 @@ pub struct ResourceRecord {
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     pub last_changed: DateTime<Utc>,
+    #[serde(default = "chrono::Utc::now")]
+    pub state_since: DateTime<Utc>,
 }
 
 impl ResourceRecord {
@@ -188,12 +194,34 @@ impl ResourceRecord {
         self.metadata.get("namespace").map(String::as_str)
     }
 
+    pub fn uptime_display(&self) -> String {
+        format_duration_human(chrono::Utc::now().signed_duration_since(self.state_since))
+    }
+
     pub fn compose_project(&self) -> Option<&str> {
         self.labels
             .get("com.docker.compose.project")
             .or_else(|| self.labels.get("io.podman.compose.project"))
             .map(String::as_str)
             .or(self.project.as_deref())
+    }
+}
+
+pub fn format_duration_human(duration: chrono::Duration) -> String {
+    let total_seconds = duration.num_seconds().max(0);
+    let days = total_seconds / 86400;
+    let hours = (total_seconds % 86400) / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -250,6 +278,8 @@ pub struct Snapshot {
     pub events: Vec<RecentEvent>,
     #[serde(default)]
     pub warnings: Vec<CollectorWarning>,
+    #[serde(default)]
+    pub last_crash_at: Option<DateTime<Utc>>,
 }
 
 impl Default for Snapshot {
@@ -260,6 +290,7 @@ impl Default for Snapshot {
             resources: Vec::new(),
             events: Vec::new(),
             warnings: Vec::new(),
+            last_crash_at: None,
         }
     }
 }
@@ -305,6 +336,7 @@ mod tests {
             urls: Default::default(),
             metadata: Default::default(),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         };
 
         assert_eq!(record.summary_name(), "stack/web:8080");
@@ -346,6 +378,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         };
 
         assert_eq!(
@@ -454,6 +487,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::from([("namespace".into(), "dev".into())]),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         };
 
         assert_eq!(record.namespace(), Some("dev"));
@@ -521,5 +555,68 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0].as_str(), "http://127.0.0.1:8080/");
         assert_eq!(urls[1].as_str(), "https://127.0.0.1:8443/");
+    }
+
+    #[test]
+    fn format_duration_human_formats_all_ranges() {
+        use super::format_duration_human;
+        use chrono::Duration;
+
+        assert_eq!(format_duration_human(Duration::seconds(5)), "5s");
+        assert_eq!(format_duration_human(Duration::seconds(0)), "0s");
+        assert_eq!(format_duration_human(Duration::seconds(59)), "59s");
+        assert_eq!(format_duration_human(Duration::seconds(60)), "1m");
+        assert_eq!(format_duration_human(Duration::seconds(2700)), "45m");
+        assert_eq!(format_duration_human(Duration::seconds(3600)), "1h 0m");
+        assert_eq!(format_duration_human(Duration::seconds(3660)), "1h 1m");
+        assert_eq!(format_duration_human(Duration::seconds(86400)), "1d 0h");
+        assert_eq!(
+            format_duration_human(Duration::seconds(3 * 86400 + 12 * 3600)),
+            "3d 12h"
+        );
+        assert_eq!(format_duration_human(Duration::seconds(-10)), "0s");
+    }
+
+    #[test]
+    fn uptime_display_returns_human_readable_string() {
+        let record = ResourceRecord {
+            id: "test:1".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: None,
+            name: "test".into(),
+            state: HealthState::Healthy,
+            runtime_status: None,
+            ports: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: Utc::now(),
+            state_since: Utc::now() - chrono::Duration::seconds(90),
+        };
+        assert_eq!(record.uptime_display(), "1m");
+    }
+
+    #[test]
+    fn state_since_is_included_in_serialization() {
+        let record = ResourceRecord {
+            id: "test:1".into(),
+            kind: ResourceKind::Container,
+            runtime: RuntimeKind::Docker,
+            project: None,
+            name: "test".into(),
+            state: HealthState::Healthy,
+            runtime_status: None,
+            ports: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: Vec::new(),
+            metadata: BTreeMap::new(),
+            last_changed: Utc::now(),
+            state_since: Utc::now(),
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        assert!(json.contains("state_since"));
+        let deserialized: ResourceRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.state_since, record.state_since);
     }
 }

@@ -33,11 +33,32 @@ struct Cli {
 enum Commands {
     Daemon(DaemonArgs),
     Render(RenderArgs),
-    Popup(RenderArgs),
+    Popup(PopupArgs),
     Query(QueryArgs),
     Action(ActionArgs),
     Config(ConfigCommand),
     InstallService(InstallServiceArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct PopupArgs {
+    #[arg(long)]
+    view: Option<String>,
+    #[arg(long, default_value = "tmux")]
+    format: String,
+    #[arg(long = "tmux-option")]
+    tmux_option: Vec<String>,
+    #[arg(long)]
+    watch: bool,
+    /// Jump to a specific resource by id on startup
+    #[arg(long)]
+    resource: Option<String>,
+    /// Override popup width (e.g. "80%" or "120")
+    #[arg(long)]
+    width: Option<String>,
+    /// Override popup height (e.g. "80%" or "40")
+    #[arg(long)]
+    height: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -54,6 +75,8 @@ struct RenderArgs {
     format: String,
     #[arg(long = "tmux-option")]
     tmux_option: Vec<String>,
+    #[arg(long)]
+    watch: bool,
 }
 
 #[derive(Debug, Args)]
@@ -76,6 +99,7 @@ struct ActionArgs {
 #[derive(Debug, Subcommand)]
 enum ConfigSubcommand {
     Validate,
+    Export,
 }
 
 #[derive(Debug, Args)]
@@ -136,46 +160,58 @@ async fn daemon_command(config_path: Option<PathBuf>, args: DaemonArgs) -> anyho
 async fn render_command(config_path: Option<PathBuf>, args: RenderArgs) -> anyhow::Result<()> {
     let overrides = parse_tmux_overrides(&args.tmux_option);
     let config = load_config(config_path.clone(), &overrides)?;
-    let snapshot = request_snapshot(&config, config_path.as_deref(), args.view.clone()).await?;
-    println!(
-        "{}",
-        render_snapshot(
-            &config,
-            args.view.as_deref(),
-            parse_render_format(&args.format)?,
-            &snapshot
-        )
-    );
-    Ok(())
+    let format = parse_render_format(&args.format)?;
+
+    if args.watch {
+        loop {
+            let snapshot =
+                request_snapshot(&config, config_path.as_deref(), args.view.clone()).await?;
+            print!("\x1b[2J\x1b[H");
+            println!(
+                "{}",
+                render_snapshot(&config, args.view.as_deref(), format.clone(), &snapshot)
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    } else {
+        let snapshot = request_snapshot(&config, config_path.as_deref(), args.view.clone()).await?;
+        println!(
+            "{}",
+            render_snapshot(&config, args.view.as_deref(), format, &snapshot)
+        );
+        Ok(())
+    }
 }
 
-async fn popup_command(config_path: Option<PathBuf>, args: RenderArgs) -> anyhow::Result<()> {
+async fn popup_command(config_path: Option<PathBuf>, args: PopupArgs) -> anyhow::Result<()> {
     let overrides = parse_tmux_overrides(&args.tmux_option);
     let config = load_config(config_path.clone(), &overrides)?;
     ensure_daemon_running(&config.socket_path, config_path.as_deref()).await?;
     let client = DaemonClient::new(config.socket_path.clone());
-    launch_popup(client, config, args.view).await
+    launch_popup(client, config, args.view, args.resource).await
 }
 
 async fn launch_popup(
     client: DaemonClient,
     config: Config,
     view: Option<String>,
+    resource: Option<String>,
 ) -> anyhow::Result<()> {
-    launch_popup_with(client, config, view, popup::run_popup).await
+    launch_popup_with(client, config, view, resource, popup::run_popup).await
 }
 
 async fn launch_popup_with<F, Fut>(
     client: DaemonClient,
     config: Config,
     view: Option<String>,
+    resource: Option<String>,
     runner: F,
 ) -> anyhow::Result<()>
 where
-    F: FnOnce(DaemonClient, Config, Option<String>) -> Fut,
+    F: FnOnce(DaemonClient, Config, Option<String>, Option<String>) -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
-    runner(client, config, view).await
+    runner(client, config, view, resource).await
 }
 
 async fn query_command(config_path: Option<PathBuf>, args: QueryArgs) -> anyhow::Result<()> {
@@ -212,6 +248,10 @@ async fn config_command(
     let config = Config::load_from(&config_path)?;
     match command.command {
         ConfigSubcommand::Validate => print!("{}", format_config_validation(&config)),
+        ConfigSubcommand::Export => {
+            let toml = toml::to_string_pretty(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+            print!("{toml}");
+        }
     }
     Ok(())
 }
@@ -360,7 +400,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use giggity_collectors::{CollectionOutput, CollectorProvider};
-    use giggity_core::config::{Config, MatchRule, ProbeKind, ProbeSpec};
+    use giggity_core::config::{Config, MatchRule, ProbeKind, ProbeSpec, ProbeType};
     use giggity_core::model::{
         HealthState, PortBinding, ResourceKind, ResourceRecord, RuntimeKind, Snapshot,
     };
@@ -371,10 +411,10 @@ mod tests {
 
     use super::{
         ActionArgs, Cli, Commands, ConfigCommand, ConfigSubcommand, DaemonArgs, InstallServiceArgs,
-        QueryArgs, RenderArgs, action_command, config_command, daemon_command, execute_action,
-        format_config_validation, format_query_output, install_service_command, launch_popup_with,
-        load_config, parse_render_format, query_command, render_command, render_snapshot,
-        request_snapshot, run_cli,
+        PopupArgs, QueryArgs, RenderArgs, action_command, config_command, daemon_command,
+        execute_action, format_config_validation, format_query_output, install_service_command,
+        launch_popup_with, load_config, parse_render_format, query_command, render_command,
+        render_snapshot, request_snapshot, run_cli,
     };
     use giggity_core::test_support::EnvVarGuard;
 
@@ -412,6 +452,7 @@ mod tests {
             urls: vec!["http://127.0.0.1:3000".parse().expect("url")],
             metadata: BTreeMap::from([("pid".into(), "123".into())]),
             last_changed: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            state_since: Utc::now(),
         }
     }
 
@@ -527,6 +568,12 @@ mod tests {
                 port: None,
             },
             timeout_millis: 0,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
         let output = format_config_validation(&config);
         assert!(output.contains("refresh_seconds should be at least 1"));
@@ -577,6 +624,7 @@ mod tests {
                 view: None,
                 format: "plain".into(),
                 tmux_option: Vec::new(),
+                watch: false,
             },
         )
         .await
@@ -627,7 +675,8 @@ mod tests {
             giggity_daemon::DaemonClient::new(dir.path().join("giggity.sock")),
             Config::load_from(&config_path).expect("config"),
             Some("default".into()),
-            |_client, _config, _view| async { Ok(()) },
+            None,
+            |_client, _config, _view, _resource| async { Ok(()) },
         )
         .await
         .expect("launch popup");
@@ -778,6 +827,7 @@ mod tests {
                 view: None,
                 format: "plain".into(),
                 tmux_option: Vec::new(),
+                watch: false,
             }),
         })
         .await
@@ -822,10 +872,14 @@ mod tests {
 
         run_cli(Cli {
             config: Some(config_path.clone()),
-            command: Commands::Popup(RenderArgs {
+            command: Commands::Popup(PopupArgs {
                 view: None,
                 format: "plain".into(),
                 tmux_option: Vec::new(),
+                watch: false,
+                resource: None,
+                width: None,
+                height: None,
             }),
         })
         .await

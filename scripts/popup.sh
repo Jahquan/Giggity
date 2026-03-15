@@ -16,9 +16,14 @@ if [[ -n "$view" ]]; then
 	popup_args+=(--view "$view")
 fi
 
+width="$(tmux_opt '@giggity_popup_width')"
+height="$(tmux_opt '@giggity_popup_height')"
+width="${width:-80%}"
+height="${height:-80%}"
+
 popup_command="$BIN popup"
 for arg in "${popup_args[@]}"; do
 	popup_command+=" $(printf '%q' "$arg")"
 done
 
-exec tmux display-popup -E "$popup_command"
+exec tmux display-popup -w "$width" -h "$height" -E "$popup_command"

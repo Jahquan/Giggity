@@ -96,6 +96,7 @@ pub fn parse_lsof_listeners(output: &str) -> Vec<ResourceRecord> {
                     ("user".into(), user.clone()),
                 ]),
                 last_changed: chrono::Utc::now(),
+                state_since: chrono::Utc::now(),
             });
         entry.ports.push(PortBinding {
             host_ip: None,
@@ -135,6 +136,7 @@ pub fn parse_ss_listeners(output: &str) -> Vec<ResourceRecord> {
                 urls: Vec::new(),
                 metadata: BTreeMap::from([("pid".into(), pid.clone())]),
                 last_changed: chrono::Utc::now(),
+                state_since: chrono::Utc::now(),
             });
         entry.ports.push(PortBinding {
             host_ip: None,
@@ -175,6 +177,7 @@ pub fn parse_netstat_listeners(output: &str) -> Vec<ResourceRecord> {
                 urls,
                 metadata: BTreeMap::new(),
                 last_changed: chrono::Utc::now(),
+                state_since: chrono::Utc::now(),
             })
         })
         .collect()
@@ -410,6 +413,7 @@ mod tests {
             urls: Vec::new(),
             metadata: std::collections::BTreeMap::new(),
             last_changed: chrono::Utc::now(),
+            state_since: chrono::Utc::now(),
         });
         enrich_host_processes(&mut resources).await;
         assert_eq!(resources[0].name, "python");

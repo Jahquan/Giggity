@@ -42,6 +42,31 @@ pub struct Config {
     pub probes: Vec<ProbeSpec>,
     #[serde(default)]
     pub views: BTreeMap<String, ViewConfig>,
+    #[serde(default)]
+    pub bookmarks: Vec<String>,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub integrations: IntegrationsConfig,
+    #[serde(default)]
+    pub popup: PopupConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PopupConfig {
+    #[serde(default = "default_popup_size")]
+    pub width: String,
+    #[serde(default = "default_popup_size")]
+    pub height: String,
+}
+
+impl Default for PopupConfig {
+    fn default() -> Self {
+        Self {
+            width: default_popup_size(),
+            height: default_popup_size(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +185,21 @@ pub struct StatusBarConfig {
     pub max_issue_names: usize,
     #[serde(default)]
     pub show_empty: bool,
+    #[serde(default)]
+    pub condensed: bool,
+    #[serde(default)]
+    pub show_runtime_counts: bool,
+    #[serde(default = "default_segment")]
+    pub segment: StatusSegment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusSegment {
+    #[default]
+    Right,
+    Left,
+    Center,
 }
 
 impl Default for StatusBarConfig {
@@ -169,6 +209,9 @@ impl Default for StatusBarConfig {
             separator: default_separator(),
             max_issue_names: default_max_issue_names(),
             show_empty: false,
+            condensed: false,
+            show_runtime_counts: false,
+            segment: StatusSegment::default(),
         }
     }
 }
@@ -227,6 +270,27 @@ pub struct ProbeSpec {
     pub kind: ProbeKind,
     #[serde(default = "default_probe_timeout_millis")]
     pub timeout_millis: u64,
+    #[serde(default)]
+    pub retries: u32,
+    #[serde(default = "default_backoff_secs")]
+    pub backoff_secs: u64,
+    #[serde(default)]
+    pub warn_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub critical_latency_ms: Option<u64>,
+    #[serde(default = "default_probe_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_probe_type")]
+    pub probe_type: ProbeType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeType {
+    #[default]
+    Http,
+    Grpc,
+    Tcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +316,65 @@ pub enum ProbeKind {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub on_crash: bool,
+    #[serde(default)]
+    pub on_recovery: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            on_crash: true,
+            on_recovery: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationsConfig {
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default)]
+    pub slack: Option<SlackConfig>,
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
+}
+
+impl Default for IntegrationsConfig {
+    fn default() -> Self {
+        Self {
+            cooldown_secs: default_cooldown_secs(),
+            slack: None,
+            telegram: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackConfig {
+    pub webhook_url: String,
+    #[serde(default = "default_true")]
+    pub on_crash: bool,
+    #[serde(default)]
+    pub on_recovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub chat_id: String,
+    #[serde(default = "default_true")]
+    pub on_crash: bool,
+    #[serde(default)]
+    pub on_recovery: bool,
+}
+
 pub type TmuxOverrides = BTreeMap<String, String>;
 
 impl Default for Config {
@@ -269,6 +392,10 @@ impl Default for Config {
             sources: SourceToggles::default(),
             probes: Vec::new(),
             views,
+            bookmarks: Vec::new(),
+            notifications: NotificationsConfig::default(),
+            integrations: IntegrationsConfig::default(),
+            popup: PopupConfig::default(),
         }
     }
 }
@@ -414,6 +541,27 @@ impl Config {
             }
         }
 
+        if let Some(slack) = &self.integrations.slack {
+            if slack.webhook_url.is_empty() {
+                warnings.push("integrations.slack.webhook_url is empty".into());
+            }
+        }
+        if let Some(telegram) = &self.integrations.telegram {
+            if telegram.bot_token.is_empty() {
+                warnings.push("integrations.telegram.bot_token is empty".into());
+            }
+            if telegram.chat_id.is_empty() {
+                warnings.push("integrations.telegram.chat_id is empty".into());
+            }
+        }
+
+        let mut probe_names = std::collections::HashSet::new();
+        for probe in &self.probes {
+            if !probe_names.insert(&probe.name) {
+                warnings.push(format!("duplicate probe name '{}'", probe.name));
+            }
+        }
+
         warnings
     }
 
@@ -448,6 +596,11 @@ impl Config {
                 }
                 "launchd_enabled" => self.sources.launchd = parse_bool(value, self.sources.launchd),
                 "systemd_enabled" => self.sources.systemd = parse_bool(value, self.sources.systemd),
+                "cooldown_secs" => {
+                    if let Ok(parsed) = value.parse() {
+                        self.integrations.cooldown_secs = parsed;
+                    }
+                }
                 "hide_patterns" => {
                     self.default_view_mut().hide = value
                         .split(',')
@@ -508,8 +661,28 @@ fn default_true() -> bool {
     true
 }
 
+fn default_cooldown_secs() -> u64 {
+    300
+}
+
 fn default_probe_timeout_millis() -> u64 {
     1_000
+}
+
+fn default_backoff_secs() -> u64 {
+    2
+}
+
+fn default_probe_interval_secs() -> u64 {
+    30
+}
+
+fn default_probe_type() -> ProbeType {
+    ProbeType::Http
+}
+
+fn default_segment() -> StatusSegment {
+    StatusSegment::Right
 }
 
 fn default_http_expected_status() -> u16 {
@@ -574,6 +747,10 @@ fn default_text_color() -> String {
     "white".to_string()
 }
 
+fn default_popup_size() -> String {
+    "80%".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -583,8 +760,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Config, DetailField, ProbeKind, ProbeSpec, QuickAction, SourceToggles, StatusBarConfig,
-        ThemeConfig, TmuxOverrides, ViewConfig, parse_bool,
+        Config, DetailField, PopupConfig, ProbeKind, ProbeSpec, ProbeType, QuickAction,
+        SourceToggles, StatusBarConfig, ThemeConfig, TmuxOverrides, ViewConfig, parse_bool,
     };
     use crate::test_support::EnvVarGuard;
 
@@ -640,6 +817,12 @@ template = "base"
                 port: Some(3000),
             },
             timeout_millis: 0,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: super::ProbeType::default(),
         });
 
         let warnings = config.validate();
@@ -903,6 +1086,12 @@ default_view = "ops"
                 port: Some(80),
             },
             timeout_millis: 0,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
 
         let warnings = config.validate();
@@ -940,6 +1129,12 @@ default_view = "ops"
                 expected_status: 200,
             },
             timeout_millis: 1_000,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
         let baseline = config.active_view(None).status_bar.max_issue_names;
         config.merge_tmux_overrides(&TmuxOverrides::from(BTreeMap::from([(
@@ -1029,5 +1224,33 @@ url = "http://127.0.0.1:3000/health"
                 QuickAction::CopyPort,
             ]
         );
+    }
+
+    #[test]
+    fn popup_config_defaults_to_80_percent() {
+        let popup = PopupConfig::default();
+        assert_eq!(popup.width, "80%");
+        assert_eq!(popup.height, "80%");
+    }
+
+    #[test]
+    fn popup_config_deserializes_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[popup]
+width = "60%"
+height = "40"
+"#,
+        )
+        .expect("config with popup");
+        assert_eq!(config.popup.width, "60%");
+        assert_eq!(config.popup.height, "40");
+    }
+
+    #[test]
+    fn popup_config_uses_defaults_when_omitted() {
+        let config: Config = toml::from_str("").expect("empty config");
+        assert_eq!(config.popup.width, "80%");
+        assert_eq!(config.popup.height, "80%");
     }
 }

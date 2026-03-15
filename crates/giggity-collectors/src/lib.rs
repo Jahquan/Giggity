@@ -7,6 +7,7 @@ mod command;
 pub mod containers;
 pub mod host;
 pub mod kubernetes;
+pub mod probes;
 pub mod service_managers;
 
 #[derive(Debug, Default, Clone)]

@@ -110,6 +110,7 @@ pub fn parse_launchctl_list(output: &str) -> Vec<ResourceRecord> {
                     ("domain".into(), "user".into()),
                 ]),
                 last_changed: chrono::Utc::now(),
+                state_since: chrono::Utc::now(),
             })
         })
         .collect()
@@ -151,6 +152,7 @@ pub fn parse_systemctl_list(output: &str, scope: &str) -> Vec<ResourceRecord> {
                     ("description".into(), description),
                 ]),
                 last_changed: chrono::Utc::now(),
+                state_since: chrono::Utc::now(),
             })
         })
         .collect()

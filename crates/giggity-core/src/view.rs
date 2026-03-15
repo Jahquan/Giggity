@@ -26,6 +26,8 @@ pub struct ViewSummary {
     pub warning_sources: Vec<String>,
     pub issues: Vec<String>,
     pub latest_change: Option<DateTime<Utc>>,
+    pub last_crash_at: Option<DateTime<Utc>>,
+    pub runtime_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +106,12 @@ pub fn resolve_view(config: &Config, view_name: Option<&str>, snapshot: &Snapsho
     sort_resources(&mut resources, &view_config);
     pin_resources(&mut resources, &view_config);
 
-    let summary = summarize(&resources, &view_config, &snapshot.warnings);
+    let summary = summarize(
+        &resources,
+        &view_config,
+        &snapshot.warnings,
+        snapshot.last_crash_at,
+    );
     let grouped = group_resources(&resources, &view_config.grouping);
 
     ResolvedView {
@@ -121,6 +128,44 @@ pub fn render_status_line(resolved: &ResolvedView) -> String {
         return "giggity idle".to_string();
     }
 
+    if resolved.config.status_bar.condensed {
+        return render_condensed(resolved);
+    }
+
+    let mut output = render_template(resolved);
+    if resolved.config.status_bar.show_runtime_counts {
+        output.push(' ');
+        output.push_str(&render_runtime_counts(resolved));
+    }
+    output
+}
+
+fn render_condensed(resolved: &ResolvedView) -> String {
+    let s = &resolved.summary;
+    let mut parts = vec![format!("ok:{}", s.healthy)];
+    if s.degraded > 0 || s.starting > 0 {
+        parts.push(format!("warn:{}", s.degraded + s.starting));
+    }
+    if s.crashed > 0 {
+        parts.push(format!("err:{}", s.crashed));
+    }
+    if resolved.config.status_bar.show_runtime_counts {
+        parts.push(render_runtime_counts(resolved));
+    }
+    parts.join(" ")
+}
+
+fn render_runtime_counts(resolved: &ResolvedView) -> String {
+    resolved
+        .summary
+        .runtime_counts
+        .iter()
+        .map(|(runtime, count)| format!("{runtime}:{count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn render_template(resolved: &ResolvedView) -> String {
     let issues = if resolved.summary.issues.is_empty() {
         "none".to_string()
     } else {
@@ -159,6 +204,10 @@ pub fn render_status_line(resolved: &ResolvedView) -> String {
 }
 
 pub fn render_tmux_status_line(resolved: &ResolvedView) -> String {
+    render_tmux_status_line_at(resolved, Utc::now())
+}
+
+fn render_tmux_status_line_at(resolved: &ResolvedView, now: DateTime<Utc>) -> String {
     if resolved.resources.is_empty() && !resolved.config.status_bar.show_empty {
         return tmux_wrap("giggity idle", &resolved.config.theme.text_color);
     }
@@ -266,7 +315,12 @@ pub fn render_tmux_status_line(resolved: &ResolvedView) -> String {
         )
         .replace("{issues}", &tmux_inline(&issues, issue_color, base));
 
-    tmux_wrap(&styled, base)
+    let flash = is_crash_flash_active(resolved.summary.last_crash_at, now);
+    if flash {
+        format!("#[fg=red,bold]{}#[default]", tmux_wrap(&styled, base))
+    } else {
+        tmux_wrap(&styled, base)
+    }
 }
 
 fn merged_sources(config: &Config, view: &ViewConfig) -> crate::config::SourceToggles {
@@ -286,6 +340,7 @@ fn resource_allowed_by_sources(
         RuntimeKind::Kubernetes => sources.kubernetes,
         RuntimeKind::Host => sources.host_listeners,
         RuntimeKind::Launchd => sources.launchd,
+        RuntimeKind::Probes => true,
         RuntimeKind::Systemd => sources.systemd,
     }
 }
@@ -453,6 +508,7 @@ fn summarize(
     resources: &[ResourceRecord],
     view: &ViewConfig,
     warnings: &[crate::model::CollectorWarning],
+    last_crash_at: Option<DateTime<Utc>>,
 ) -> ViewSummary {
     let warning_sources = warnings
         .iter()
@@ -473,6 +529,8 @@ fn summarize(
         warning_sources,
         issues: Vec::new(),
         latest_change: resources.iter().map(|resource| resource.last_changed).max(),
+        last_crash_at,
+        runtime_counts: BTreeMap::new(),
     };
 
     for resource in resources {
@@ -484,6 +542,10 @@ fn summarize(
             HealthState::Stopped => summary.stopped += 1,
             HealthState::Unknown => summary.unknown += 1,
         }
+        *summary
+            .runtime_counts
+            .entry(resource.runtime.to_string())
+            .or_default() += 1;
     }
 
     let stack_keys = resources
@@ -575,6 +637,18 @@ impl CompiledRegex {
     }
 }
 
+const CRASH_FLASH_SECONDS: i64 = 30;
+
+fn is_crash_flash_active(last_crash_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last_crash_at {
+        Some(crash_time) => {
+            let elapsed = now.signed_duration_since(crash_time).num_seconds();
+            elapsed >= 0 && elapsed < CRASH_FLASH_SECONDS
+        }
+        None => false,
+    }
+}
+
 fn tmux_inline(value: &str, color: &str, base_color: &str) -> String {
     format!("#[fg={color}]{value}#[fg={base_color}]")
 }
@@ -619,6 +693,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::from([("namespace".into(), "ns".into())]),
             last_changed: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            state_since: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
         }
     }
 
@@ -818,6 +893,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 10).unwrap(),
+            state_since: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 10).unwrap(),
         };
         let web = ResourceRecord {
             kind: ResourceKind::Container,

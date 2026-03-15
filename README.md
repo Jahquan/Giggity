@@ -2,7 +2,7 @@
 
 Giggity is a Rust-first tmux dashboard for developers who run a lot of local services and containers.
 
-It keeps a system-wide snapshot of what is running on the machine, renders a compact tmux status segment, and provides an interactive popup for inspection and operator actions. The current release is V2: Docker, Podman, nerdctl, Kubernetes pods, compose-stack resources, richer host listener names, `launchd`, and `systemd` are supported today.
+It keeps a system-wide snapshot of what is running on the machine, renders a compact tmux status segment, and provides an interactive popup for inspection and operator actions. The current release is V3, building on V2's multi-runtime foundation with streaming, notifications, integrations, health probes, and a fully-featured TUI.
 
 ## What Giggity Does
 
@@ -16,15 +16,18 @@ Giggity continuously inventories developer-facing workloads across the machine a
 - host processes that are actively listening on TCP ports
 - `launchd` jobs on macOS
 - `systemd` units on Linux
+- standalone health probes (HTTP, TCP, gRPC, command)
 
 From that inventory, Giggity gives you:
 
-- a tmux status-bar summary
-- an interactive popup dashboard
-- recent event memory for state transitions
-- runtime-aware logs and control actions
+- a tmux status-bar summary with condensed and per-runtime modes
+- an interactive popup dashboard with group headers, state filtering, and bookmarks
+- recent event memory for state transitions with flapping detection
+- runtime-aware logs, control actions, and force kill
+- streaming logs and events over the daemon socket
+- desktop notifications on macOS with Slack and Telegram integration
 - a config-driven view system for filtering, grouping, sorting, and rendering
-- optional probes that can override raw runtime state with health checks
+- customizable popup sizing and per-resource jump-to
 
 The intent is simple: if you are running databases, APIs, frontends, workers, queues, and local infrastructure, Giggity should tell you what is up, what is unhealthy, and what just broke without making you tab through five different tools.
 
@@ -57,6 +60,16 @@ Giggity understands:
 - Kubernetes pod phases and container waiting / termination reasons
 - compose-stack rollups synthesized across multi-service projects
 
+### Container data enrichment
+
+V3 enriches container metadata with:
+
+- **Image info** — image name and tag extracted into metadata
+- **Network info** — network names and IPs
+- **Volume/mount info** — mount points as `source:destination` pairs
+- **Environment variables** — extracted with automatic redaction of sensitive keys (PASSWORD, SECRET, TOKEN, KEY, API_KEY)
+- **Uptime display** — human-readable uptime since last state change
+
 ### Host service discovery
 
 Giggity also tracks non-containerized services by finding TCP listeners with:
@@ -65,20 +78,11 @@ Giggity also tracks non-containerized services by finding TCP listeners with:
 - `ss` on Linux as a fallback
 - `netstat` as a final fallback
 
-This covers the common local-service case where a developer has:
-
-- a `postgres` process on `:5432`
-- a Python dev server on `:8000`
-- a Node app on `:3000`
-- a background worker exposing an admin port
-
 When a PID is available, Giggity enriches the display name with the full process command line from `ps`, so the dashboard can show `node server.js` or `python manage.py runserver` instead of five rows all named `node` or `python`.
 
 ### Kubernetes visibility
 
-Giggity V2 adds Kubernetes pod collection through the current `kubectl` context.
-
-Today that includes:
+Giggity includes Kubernetes pod collection through the current `kubectl` context:
 
 - pod name
 - namespace
@@ -87,13 +91,11 @@ Today that includes:
 - waiting / termination reasons
 - optional host ports when declared
 
-The Kubernetes collector is intentionally pod-focused in V2. It does not yet model deployments, services, or rollouts as first-class resources.
+The Kubernetes collector is intentionally pod-focused. It does not yet model deployments, services, or rollouts as first-class resources.
 
 ### Compose stack resources
 
-Giggity V2 also synthesizes stack-level resources for multi-service compose projects.
-
-That means a compose app can now appear twice in useful ways:
+Giggity synthesizes stack-level resources for multi-service compose projects:
 
 - as its underlying container resources
 - as a single stack rollup resource such as `myapp stack`
@@ -106,16 +108,12 @@ Stack resources aggregate:
 - published ports
 - compose project identity
 
-Issue summaries prefer the stack rollup over every individual compose member so the tmux segment stays compact.
-
 ### Service manager visibility
 
 On supported platforms, Giggity also collects:
 
 - `launchd` services on macOS
 - `systemd` units on Linux
-
-This is useful when part of your stack is managed by the OS instead of a container runtime.
 
 ### Health states
 
@@ -130,71 +128,113 @@ Every resource is normalized into one of these states:
 
 Those states come from runtime/service-manager status first, then can be refined by user-defined probes.
 
+### State intelligence
+
+V3 adds automatic state analysis:
+
+- **Port conflict detection** — flags resources listening on the same port
+- **Restart flapping detection** — marks resources that crash/restart more than 3 times in 10 minutes
+- **Uptime tracking** — `state_since` timestamp on every resource with human-readable display
+
 ### Health probes
 
-Probes let you turn “the process is running” into “the service is actually healthy.”
+Probes let you turn "the process is running" into "the service is actually healthy."
 
-Supported probe types:
+V3 adds standalone probe resources alongside the existing probe-as-override system:
 
-- TCP probe
-- HTTP probe
-- command probe
+- **HTTP probes** — GET a URL, check status code, measure latency
+- **TCP probes** — connect with timeout
+- **gRPC probes** — TCP connect check (no full gRPC dependency)
+- **Command probes** — run a command, check exit status and output
 
-Templates in probe values can reference:
+Probe features:
 
-- `{id}`
-- `{name}`
-- `{project}`
-- `{port}`
-- `{runtime}`
+- configurable retry count with exponential backoff
+- latency thresholds — warn and critical levels that override health state
+- each standalone probe appears as its own resource in the dashboard
+- metadata includes `latency_ms`, `last_check`, `probe_type`, and error details
 
-Examples:
+Templates in probe values can reference `{id}`, `{name}`, `{project}`, `{port}`, `{runtime}`.
 
-- HTTP health endpoint: `http://127.0.0.1:{port}/health`
-- TCP override for a known port
-- command assertions against live output
+### Protocol streaming
+
+V3 introduces streaming over the daemon socket:
+
+- **StreamLogs** — tail logs for a resource with real-time updates
+- **StreamEvents** — subscribe to state transition events for a view
+- **CloseStream** — gracefully terminate a stream
+
+### Notifications
+
+- **Tmux status flash** — status bar flashes red when a resource crashes (30-second window)
+- **Desktop notifications** — macOS `osascript` notifications on crash/recovery (configurable)
+- **Notification muting** — mute all notifications for a duration via `m` key or API
+
+### Integrations
+
+V3 supports two notification integrations:
+
+- **Slack** — webhook-based crash/recovery alerts
+- **Telegram** — bot API crash/recovery messages
+- **Rate limiting** — configurable per-resource cooldown (default 5 minutes) to prevent spam
 
 ### tmux status bar
 
 Giggity renders a compact tmux segment through `#(...)`.
 
-The segment is:
+V3 status bar features:
 
 - theme-aware in tmux mode
 - template-driven
 - view-aware
 - overrideable from tmux options
+- **condensed mode** — `ok:5 warn:1 err:2` instead of resource names
+- **per-runtime counts** — `docker:3 k8s:2 host:1`
+- **crash blink** — blink attribute for first 60 seconds after a crash
 - summary-first, so it stays useful in narrow status bars
 
 ### Interactive popup TUI
 
 The popup is for deeper inspection when the status line says something is wrong.
 
-It supports:
+V3 popup features:
 
 - refresh-driven live inventory
-- local filtering
-- regrouping
-- selection state
-- details view
-- log view
+- **grouped resource list** — visual group headers (yellow, bold) when grouping is active
+- **state filtering** — cycle through All/Healthy/Crashed/Stopped/Degraded/Starting/Unknown with `F`
+- **color-coded states** — green healthy, red crashed, yellow degraded, gray stopped, cyan starting
+- local text filtering with **filter history** (last 10, navigate with Up/Down)
+- **5 detail tabs** — Info, Logs, Events, Labels, Metadata (switch with 1-5)
+- **bookmarks** — star resources with `b`, persisted to `~/.local/state/giggity/bookmarks.json`
+- **resource diff** — `d` key shows what changed since last refresh
+- **help overlay** — `?` key shows all keybindings
+- **mouse support** — click to select, scroll wheel to navigate
+- sort cycling
 - confirmation before mutating actions
+- **customizable size** — configurable via config, CLI args, or tmux options
+- **`--resource` flag** — auto-select a resource on popup open
 
 ### Operator actions
 
-Giggity currently supports these quick actions:
+Giggity supports these quick actions:
 
 - `logs`
 - `restart`
 - `stop`
+- `force-kill` (V3)
 - `open-url`
 - `copy-port`
+- `copy-id` (V3)
+- `bulk-restart` (V3)
 
-Actions are runtime-aware where possible:
+Actions are runtime-aware:
 
-- Docker / Podman / nerdctl container logs use the matching runtime CLI
-- `systemd` logs use `journalctl`
-- restart / stop map to runtime-appropriate commands when supported
+- Docker / Podman / nerdctl containers support restart, stop, force kill, and logs
+- `systemd` and `launchd` units support restart, stop, and force kill
+- Kubernetes pods support restart (via `kubectl delete pod`), force kill (with `--grace-period=0 --force`), and logs
+- Compose stacks support restart, stop, and kill via `docker compose -p <project>`
+- ad-hoc host listeners support stop via `kill -TERM` and force kill via `kill -9`
+- Probe resources do not support actions (safe error returned)
 - URL opening uses `open` on macOS and `xdg-open` elsewhere
 - port copy uses the OS clipboard path when available and falls back safely
 
@@ -210,6 +250,15 @@ That matters for:
 
 The popup details view can surface those recent events so the user has context for why the dashboard changed.
 
+### Config management
+
+V3 adds:
+
+- **Config export** — `ExportConfig` request returns effective config as TOML
+- **Config hot-reload** — status bar flash on config file changes
+- **Enhanced validation** — checks for invalid runtimes, duplicate views, bad regex, unknown fields
+- **Watch mode** — `--watch` flag for continuous status line rendering
+
 ## Architecture
 
 The codebase is a Cargo workspace with four crates:
@@ -217,24 +266,27 @@ The codebase is a Cargo workspace with four crates:
 - `giggity-core`
   - domain model
   - config loading and validation
-  - snapshot protocol
-  - state engine
+  - snapshot protocol with streaming support
+  - state engine with port conflict and flapping detection
   - view resolution and rendering
 - `giggity-collectors`
-  - Docker / Podman / nerdctl collection
+  - Docker / Podman / nerdctl collection with image/network/volume/env enrichment
   - Kubernetes pod collection
   - compose-stack synthesis
   - host listener collection
   - `launchd` / `systemd` collection
+  - standalone health probes (HTTP, TCP, gRPC, command)
 - `giggity-daemon`
   - Unix socket daemon
-  - poll loop
-  - probe application
-  - action dispatch
+  - poll loop with probe collection
+  - action dispatch (restart, stop, force kill, bulk restart)
+  - streaming (logs, events)
+  - notification dispatch (desktop, Slack, Telegram) with rate limiting
+  - config hot-reload
 - `giggity-cli`
   - CLI entrypoints
   - tmux-facing render flow
-  - popup TUI
+  - popup TUI with tabs, bookmarks, diff, help, state filter
   - install-service support
 
 Dependency direction is intentionally one-way:
@@ -288,18 +340,6 @@ nix run
 nix flake check
 ```
 
-### Plugin bootstrap behavior
-
-The shell wrappers in `scripts/` call `scripts/bootstrap.sh`.
-
-That script:
-
-- checks whether `target/release/giggity` exists
-- rebuilds when the workspace is newer than the built binary
-- symlinks the release binary into `scripts/giggity`
-
-That means tmux can use a stable script path while the actual binary is rebuilt in place.
-
 ## Quick Start
 
 ### 1. Render a summary
@@ -312,11 +352,6 @@ giggity render --format plain
 
 ```bash
 giggity query
-```
-
-JSON output is also available:
-
-```bash
 giggity query --json
 ```
 
@@ -324,15 +359,24 @@ giggity query --json
 
 ```bash
 giggity popup
+giggity popup --view ops
+giggity popup --resource docker:web
+giggity popup --width 90% --height 70%
 ```
 
-### 4. Validate config
+### 4. Watch mode
+
+```bash
+giggity render --format plain --watch
+```
+
+### 5. Validate config
 
 ```bash
 giggity config validate
 ```
 
-### 5. Install the daemon as a user service
+### 6. Install the daemon as a user service
 
 ```bash
 giggity install-service --activate
@@ -363,19 +407,14 @@ giggity install-service --activate
 | `launchd` | `launchctl` commands | macOS only |
 | `systemd` | `systemctl` / `journalctl` | Linux only |
 
-### Current scope boundary
+### Health probes
 
-V2 includes:
-
-- Kubernetes pod collection
-- compose stack synthetic resources
-- richer host process command-name enrichment
-
-Still out of scope in V2:
-
-- Kubernetes services, deployments, and rollout objects as first-class resources
-- compose stack mutating actions
-- richer host process ancestry / process-tree grouping
+| Probe type | How Giggity Checks | Notes |
+|---|---|---|
+| HTTP | `GET` with status code check | Supports latency thresholds and retries |
+| TCP | `TcpStream::connect` with timeout | Simple connectivity check |
+| gRPC | TCP connect check | No full gRPC dependency |
+| Command | Subprocess with exit code / output check | Shell command execution |
 
 ## CLI Reference
 
@@ -385,11 +424,6 @@ Runs the Unix socket daemon in the foreground.
 
 ```bash
 giggity daemon
-```
-
-Run it in the background:
-
-```bash
 giggity daemon --background
 ```
 
@@ -401,9 +435,8 @@ Renders the current view as a status line.
 giggity render --format plain
 giggity render --format tmux
 giggity render --view ops
+giggity render --format plain --watch
 ```
-
-Tmux scripts use the `tmux` format so theme colors are emitted as tmux formatting sequences.
 
 ### `giggity popup`
 
@@ -412,6 +445,8 @@ Launches the interactive popup UI.
 ```bash
 giggity popup
 giggity popup --view ops
+giggity popup --resource docker:web
+giggity popup --width 90% --height 60%
 ```
 
 ### `giggity query`
@@ -432,6 +467,7 @@ Runs a resource action.
 giggity action logs --resource docker:abcd1234
 giggity action restart --resource docker:abcd1234 --confirm
 giggity action stop --resource systemd:postgresql.service --confirm
+giggity action force-kill --resource docker:abcd1234 --confirm
 giggity action open-url --resource host:123
 giggity action copy-port --resource docker:abcd1234
 ```
@@ -446,6 +482,8 @@ Validates config structure and reports warnings such as:
 - missing named default views
 - zero refresh intervals
 - zero probe timeouts
+- duplicate view names
+- unknown fields
 
 ### `giggity install-service`
 
@@ -462,24 +500,40 @@ The popup is intended to be the operational view, not just a bigger copy of the 
 
 ### Keybindings
 
-- `/` enter filter mode
-- `v` switch view
-- `g` cycle grouping
-- `l` toggle logs
-- `r` restart selected resource
-- `s` stop selected resource
-- `o` open primary URL
-- `c` copy primary port
-- `Enter` toggle details / logs
-- `q` exit
+| Key | Action |
+|---|---|
+| `q` / `Esc` | quit |
+| `/` | enter filter mode (Up/Down for history) |
+| `F` | cycle state filter (all/healthy/crashed/stopped/degraded/starting/unknown) |
+| `v` | switch view |
+| `g` | cycle grouping (severity/runtime/project/namespace/compose_stack/unit_domain/none) |
+| `S` | cycle sort key |
+| `l` | toggle logs |
+| `r` | restart selected resource (confirm) |
+| `s` | stop selected resource (confirm) |
+| `K` | force kill selected resource (confirm) |
+| `o` | open primary URL |
+| `c` | copy primary port |
+| `y` / `Y` | copy resource id / name |
+| `b` | toggle bookmark |
+| `d` | toggle resource diff view |
+| `m` / `M` | mute / unmute notifications |
+| `1`-`5` | switch detail tab (Info/Logs/Events/Labels/Metadata) |
+| `Enter` | toggle details / logs |
+| `?` | help overlay |
 
 ### Popup behavior
 
 - filtering is local to the popup session
+- state filter restricts the list to a single health state
+- grouping adds visual section headers to the resource list
 - logs are lazy-loaded for the selected resource
 - mutating actions require confirmation
 - the popup refreshes using the daemon snapshot interval
-- local grouping overrides do not permanently rewrite config
+- local grouping and sorting overrides do not permanently rewrite config
+- bookmarks are persisted to `~/.local/state/giggity/bookmarks.json`
+- resource diff shows state, port, label, and metadata changes since last refresh
+- mouse click to select, scroll wheel to navigate
 
 ## Configuration
 
@@ -503,10 +557,12 @@ Current top-level config keys:
 - `sources`
 - `probes`
 - `views`
+- `notifications`
+- `integrations`
+- `popup`
+- `bookmarks`
 
 ### Source toggles
-
-The `sources` table controls which collectors run:
 
 ```toml
 [sources]
@@ -517,6 +573,87 @@ kubernetes = true
 host_listeners = true
 launchd = true
 systemd = true
+```
+
+### Notifications
+
+```toml
+[notifications]
+enabled = true
+on_crash = true
+on_recovery = true
+```
+
+### Integrations
+
+```toml
+[integrations]
+cooldown_secs = 300
+
+[integrations.slack]
+webhook_url = "https://hooks.slack.com/services/..."
+on_crash = true
+on_recovery = false
+
+[integrations.telegram]
+bot_token = "123456:ABC..."
+chat_id = "-100123456789"
+on_crash = true
+on_recovery = false
+```
+
+### Popup configuration
+
+```toml
+[popup]
+width = "80%"
+height = "80%"
+```
+
+Also configurable via tmux options `@giggity_popup_width` and `@giggity_popup_height`.
+
+### Standalone probes
+
+```toml
+[[probes]]
+name = "api-health"
+probe_type = "http"
+target = "http://localhost:8080/health"
+expected_status = 200
+interval_secs = 30
+timeout_secs = 5
+retries = 2
+backoff_secs = 1
+warn_latency_ms = 500
+critical_latency_ms = 2000
+```
+
+### View-scoped probes
+
+```toml
+[[probes]]
+name = "api-http"
+probe = "http"
+name_regex = "^api$"
+url = "http://127.0.0.1:{port}/health"
+expected_status = 200
+timeout_millis = 1000
+
+[[probes]]
+name = "postgres-port"
+probe = "tcp"
+name_regex = "^postgres$"
+port = 5432
+timeout_millis = 1000
+
+[[probes]]
+name = "worker-check"
+probe = "command"
+name_regex = "^worker$"
+program = "sh"
+args = ["-lc", "echo ok"]
+contains = "ok"
+timeout_millis = 1000
 ```
 
 ### Views
@@ -562,11 +699,11 @@ template = "svc {total} ok {healthy} warn {degraded} down {crashed} stop {stoppe
 separator = " "
 max_issue_names = 4
 show_empty = false
+condensed = false
+show_runtime_counts = false
 ```
 
 ### Grouping modes
-
-Supported grouping modes:
 
 - `severity`
 - `runtime`
@@ -578,45 +715,11 @@ Supported grouping modes:
 
 ### Sorting modes
 
-Supported sorting modes:
-
 - `severity`
 - `name`
 - `last_change`
 - `runtime`
 - `port`
-
-### Columns
-
-Supported table columns:
-
-- `name`
-- `runtime`
-- `state`
-- `project`
-- `ports`
-- `urls`
-- `updated`
-
-### Detail fields
-
-Supported detail sections:
-
-- `labels`
-- `metadata`
-- `urls`
-- `ports`
-- `events`
-
-### Quick actions
-
-Views can enable these actions:
-
-- `logs`
-- `restart`
-- `stop`
-- `open_url`
-- `copy_port`
 
 ### Match rules
 
@@ -650,16 +753,8 @@ name_regex = "^com\\.apple\\."
 
 Supported placeholders:
 
-- `{total}`
-- `{healthy}`
-- `{starting}`
-- `{degraded}`
-- `{crashed}`
-- `{stopped}`
-- `{unknown}`
-- `{collector_warnings}`
-- `{warning_sources}`
-- `{issues}`
+- `{total}`, `{healthy}`, `{starting}`, `{degraded}`, `{crashed}`, `{stopped}`, `{unknown}`
+- `{collector_warnings}`, `{warning_sources}`, `{issues}`
 
 Default template:
 
@@ -669,46 +764,12 @@ svc {total} ok {healthy} warn {degraded} down {crashed} stop {stopped} src {coll
 
 ### Themes
 
-A view theme controls tmux-colored output:
-
 ```toml
 [views.default.theme]
 ok_color = "green"
 warn_color = "yellow"
 error_color = "red"
 text_color = "white"
-```
-
-### Probes
-
-Probe blocks are matched the same way views are matched, then executed against matching resources.
-
-Example:
-
-```toml
-[[probes]]
-name = "api-http"
-probe = "http"
-name_regex = "^api$"
-url = "http://127.0.0.1:{port}/health"
-expected_status = 200
-timeout_millis = 1000
-
-[[probes]]
-name = "postgres-port"
-probe = "tcp"
-name_regex = "^postgres$"
-port = 5432
-timeout_millis = 1000
-
-[[probes]]
-name = "worker-check"
-probe = "command"
-name_regex = "^worker$"
-program = "sh"
-args = ["-lc", "echo ok"]
-contains = "ok"
-timeout_millis = 1000
 ```
 
 ## tmux Integration
@@ -737,6 +798,8 @@ The shell wrappers read these tmux globals:
 - `@giggity_host_enabled`
 - `@giggity_launchd_enabled`
 - `@giggity_systemd_enabled`
+- `@giggity_popup_width`
+- `@giggity_popup_height`
 
 Example:
 
@@ -744,16 +807,13 @@ Example:
 set -g @giggity_view 'ops'
 set -g @giggity_template 'svc {total} down {crashed} [{issues}]'
 set -g @giggity_hide_patterns '^com\.apple\.,^port-'
-set -g @giggity_max_issue_names 5
-set -g @giggity_podman_enabled off
-set -g @giggity_kubernetes_enabled on
+set -g @giggity_popup_width '90%'
+set -g @giggity_popup_height '70%'
 ```
-
-These overrides are intentionally scoped to a focused subset of the config surface so tmux remains simple.
 
 ## State Model
 
-Giggity’s state engine differentiates between:
+Giggity's state engine differentiates between:
 
 - durable resources such as containers and managed units
 - transient host listeners
@@ -774,104 +834,25 @@ Current log behavior:
 - compose-stack resources: logs unavailable
 - other resource types: logs unavailable
 
-### Restart / stop
+### Restart / stop / force kill
 
-Current action support is runtime-specific and intentionally conservative.
+Actions are runtime-specific:
 
-Today that means:
-
-- Docker / Podman / nerdctl containers support restart and stop
-- `systemd` and `launchd` units support restart and stop
-- ad-hoc host listeners support stop via `kill -TERM`
-- Kubernetes pods support stop via `kubectl delete pod ... --wait=false`
-- Kubernetes pods do not support restart as a first-class action in V2
-- compose-stack resources do not support restart / stop actions in V2
+| Runtime | Restart | Stop | Force Kill |
+|---|---|---|---|
+| Docker | `docker restart` | `docker stop` | `docker kill` |
+| Podman | `podman restart` | `podman stop` | `podman kill` |
+| nerdctl | `nerdctl restart` | `nerdctl stop` | `nerdctl kill` |
+| Kubernetes | `kubectl delete pod --wait=false` | not supported | `kubectl delete pod --grace-period=0 --force` |
+| Compose stack | `docker compose -p <project> restart` | `docker compose -p <project> stop` | `docker compose -p <project> kill` |
+| `systemd` | `systemctl restart` | `systemctl stop` | `systemctl kill --signal=SIGKILL` |
+| `launchd` | `launchctl kickstart -k` | `launchctl bootout` | `launchctl kill 9` |
+| Host process | not supported | `kill -TERM` | `kill -9` |
+| Probe | not supported | not supported | not supported |
 
 Unsupported targets return safe errors instead of pretending the action succeeded.
 
-### Open URL
-
-`open-url` uses the first inferred or runtime-derived URL on the resource.
-
-### Copy port
-
-`copy-port` uses the first published or discovered host port on the resource.
-
-## Runtime Fixtures and Smoke Tests
-
-The repo includes runtime-neutral fixtures for real end-to-end verification.
-
-Relevant files:
-
-- `examples/containers/basic-http/Dockerfile`
-- `examples/containers/basic-http/index.html`
-- `examples/containers/basic-http/health`
-- `examples/containers/compose.yaml`
-- `scripts/runtime-fixture.sh`
-- `scripts/smoke-runtime.sh`
-
-### Fixture resources
-
-The fixture flow builds and runs:
-
-- `giggity-fixture-web`
-- `giggity-fixture-worker`
-- `giggity-fixture-crash`
-
-Expected states:
-
-- web: `healthy`
-- worker: `healthy`
-- crash: `crashed`
-
-### Bring fixtures up manually
-
-```bash
-./scripts/runtime-fixture.sh docker up
-./scripts/runtime-fixture.sh podman up
-./scripts/runtime-fixture.sh nerdctl up
-```
-
-Tear them down:
-
-```bash
-./scripts/runtime-fixture.sh docker down
-```
-
-### Run an end-to-end smoke test
-
-```bash
-./scripts/smoke-runtime.sh docker
-./scripts/smoke-runtime.sh podman
-./scripts/smoke-runtime.sh nerdctl
-```
-
-These scripts:
-
-- build the local fixture image
-- start the runtime fixtures
-- launch a temporary Giggity daemon
-- assert that the runtime snapshot contains the expected states
-
-### Non-default sockets
-
-If your runtime is not on the default local socket, set the normal runtime environment first:
-
-```bash
-export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
-./scripts/smoke-runtime.sh docker
-```
-
-```bash
-export CONTAINER_HOST="unix:///path/to/podman.sock"
-./scripts/smoke-runtime.sh podman
-```
-
 ## Verification and Quality
-
-The repo is built with a verification-first workflow.
-
-Typical verification commands:
 
 ```bash
 cargo fmt --check
@@ -913,52 +894,6 @@ giggity config validate
 
 to inspect the current snapshot and config warnings directly.
 
-### tmux plugin is not rebuilding
-
-The wrappers rebuild automatically when:
-
-- `target/release/giggity` does not exist
-- `Cargo.toml` is newer than the binary
-- any file under `crates/` is newer than the binary
-
-You can also force a rebuild manually:
-
-```bash
-cargo build --release --package giggity
-```
-
-### Popup opens but actions fail
-
-That usually means the underlying runtime action failed, not the popup itself. Check:
-
-- runtime socket availability
-- CLI availability on `PATH`
-- permissions for the target runtime or service manager
-
-## Roadmap
-
-Current V2 scope is intentionally focused on:
-
-- local container runtimes
-- host listeners
-- OS service managers
-- tmux rendering and popup inspection
-
-Current V2 ships the biggest next-step additions already:
-
-- Kubernetes pod collection
-- richer host command-name enrichment
-- compose stack-level synthetic resources
-
-Likely next high-value additions after V2:
-
-- Kubernetes services / deployments / rollout awareness
-- compose stack-level mutating actions
-- live event streaming from Docker / Podman / Kubernetes
-- richer host process ancestry and dependency views
-
-Those are roadmap items, not current documented behavior.
-
 ## License
 
-Add the license that matches how you want to publish Giggity before making the repository public.
+MIT

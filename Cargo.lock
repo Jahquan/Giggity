@@ -751,6 +751,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -766,6 +767,7 @@ dependencies = [
  "futures-util",
  "giggity-core",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -804,6 +806,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
 ]
 

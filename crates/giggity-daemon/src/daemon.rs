@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use giggity_collectors::{CollectionOutput, CollectorProvider, SystemCollector};
 use giggity_core::config::{Config, ProbeKind, ProbeSpec};
-use giggity_core::model::{CollectorWarning, HealthState, ResourceKind, ResourceRecord, Snapshot};
+use giggity_core::model::{
+    CollectorWarning, HealthState, RecentEvent, ResourceKind, ResourceRecord, Snapshot,
+};
 use giggity_core::protocol::{ActionKind, ClientRequest, RenderFormat, ServerResponse};
 use giggity_core::state::StateEngine;
 use giggity_core::view::{
@@ -18,9 +21,9 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{RwLock, broadcast, oneshot};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -30,10 +33,19 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 static COMMAND_OVERRIDES: OnceLock<Mutex<BTreeMap<String, PathBuf>>> = OnceLock::new();
 
+/// Streaming events broadcast to connected streaming clients.
+#[derive(Debug, Clone)]
+pub(crate) enum StreamEvent {
+    StateChanged(ServerResponse),
+    ConfigReloaded,
+}
+
 #[derive(Debug, Clone)]
 struct Store {
     config: Config,
     snapshot: Snapshot,
+    muted_until: Option<DateTime<Utc>>,
+    last_notified: HashMap<String, DateTime<Utc>>,
 }
 
 pub async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -62,11 +74,16 @@ pub async fn run_daemon_with_collector(
     let store = Arc::new(RwLock::new(Store {
         config: initial_config.clone(),
         snapshot: Snapshot::default(),
+        muted_until: None,
+        last_notified: HashMap::new(),
     }));
+
+    let (event_tx, _) = broadcast::channel::<StreamEvent>(256);
 
     let poll_store = store.clone();
     let poll_collector = collector.clone();
     let poll_path = config_path.clone();
+    let poll_event_tx = event_tx.clone();
     let collector_initial_config = initial_config.clone();
     let collector_task = tokio::spawn(async move {
         let mut engine = StateEngine::new(Duration::from_secs(
@@ -84,6 +101,7 @@ pub async fn run_daemon_with_collector(
             if config != previous_config {
                 log_config_reload(&poll_path, &config);
                 previous_config = config.clone();
+                let _ = poll_event_tx.send(StreamEvent::ConfigReloaded);
             }
             let output = match poll_collector.collect(&config).await {
                 Ok(output) => output,
@@ -97,9 +115,13 @@ pub async fn run_daemon_with_collector(
             };
             let mut resources = output.resources;
             apply_probes(&config, &mut resources).await;
+            let probe_resources = giggity_collectors::probes::collect_probes(&config.probes).await;
+            resources.extend(probe_resources);
 
             let snapshot = engine.ingest(Utc::now(), resources, output.warnings);
+            broadcast_new_events(&poll_event_tx, &snapshot);
             let mut guard = poll_store.write().await;
+            dispatch_notifications(&mut guard, &snapshot).await;
             guard.config = config;
             guard.snapshot = snapshot;
             let wait_seconds = guard.config.refresh_seconds.max(1);
@@ -128,8 +150,9 @@ pub async fn run_daemon_with_collector(
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 let connection_store = store.clone();
+                let connection_event_tx = event_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, connection_store).await {
+                    if let Err(error) = handle_connection(stream, connection_store, connection_event_tx).await {
                         error!(?error, "connection handling failed");
                     }
                 });
@@ -183,19 +206,235 @@ impl DaemonClient {
         reader.read_line(&mut line).await?;
         Ok(serde_json::from_str(line.trim())?)
     }
+
+    /// Open a streaming connection. Returns the underlying stream split into a
+    /// reader (for receiving `ServerResponse` lines) and writer (for sending
+    /// `CloseStream`). The caller is responsible for reading lines and
+    /// deserializing them.
+    pub async fn open_stream(&self, request: &ClientRequest) -> anyhow::Result<StreamHandle> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| format!("connecting to {}", self.socket_path.display()))?;
+        let (reader, mut writer) = stream.into_split();
+        let payload = serde_json::to_string(request)?;
+        writer.write_all(payload.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        // Do NOT shutdown -- keep the connection open for streaming
+        Ok(StreamHandle {
+            reader: BufReader::new(reader),
+            writer,
+        })
+    }
 }
 
-async fn handle_connection(stream: UnixStream, store: Arc<RwLock<Store>>) -> anyhow::Result<()> {
+/// Handle to an open streaming connection.
+pub struct StreamHandle {
+    pub reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    pub writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl StreamHandle {
+    /// Read the next streamed response. Returns `None` on EOF.
+    pub async fn next_response(&mut self) -> anyhow::Result<Option<ServerResponse>> {
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(line.trim())?))
+    }
+
+    /// Send a close request to gracefully end the stream.
+    pub async fn close(mut self) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(&ClientRequest::CloseStream)?;
+        self.writer.write_all(payload.as_bytes()).await?;
+        self.writer.write_all(b"\n").await?;
+        Ok(())
+    }
+}
+
+async fn handle_connection(
+    stream: UnixStream,
+    store: Arc<RwLock<Store>>,
+    event_tx: broadcast::Sender<StreamEvent>,
+) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     let request: ClientRequest = serde_json::from_str(line.trim())?;
-    let response = handle_request(request, store).await;
-    let payload = serde_json::to_string(&response)?;
-    writer.write_all(payload.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    Ok(())
+
+    match request {
+        ClientRequest::StreamLogs { resource_id, lines } => {
+            handle_stream_logs(reader, writer, store, &resource_id, lines).await
+        }
+        ClientRequest::StreamEvents { view } => {
+            handle_stream_events(reader, writer, event_tx, view).await
+        }
+        _ => {
+            let response = handle_request(request, store).await;
+            let payload = serde_json::to_string(&response)?;
+            writer.write_all(payload.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            Ok(())
+        }
+    }
+}
+
+fn broadcast_new_events(tx: &broadcast::Sender<StreamEvent>, snapshot: &Snapshot) {
+    for event in &snapshot.events {
+        let response = ServerResponse::Event {
+            event: event.clone(),
+        };
+        let _ = tx.send(StreamEvent::StateChanged(response));
+    }
+}
+
+async fn dispatch_notifications(store: &mut Store, snapshot: &Snapshot) {
+    let now = Utc::now();
+    let is_muted = store.muted_until.map(|until| now < until).unwrap_or(false);
+
+    let cooldown_secs = store.config.integrations.cooldown_secs as i64;
+
+    for event in &snapshot.events {
+        let is_crash = event.to == HealthState::Crashed || event.to == HealthState::Degraded;
+        let is_recovery = event.from.is_some()
+            && matches!(
+                event.from,
+                Some(HealthState::Crashed) | Some(HealthState::Degraded)
+            )
+            && matches!(event.to, HealthState::Healthy);
+
+        if !is_crash && !is_recovery {
+            continue;
+        }
+
+        if let Some(last) = store.last_notified.get(&event.resource_id) {
+            let elapsed = now.signed_duration_since(*last).num_seconds();
+            if elapsed < cooldown_secs {
+                debug!(
+                    resource = %event.resource_id,
+                    elapsed_secs = elapsed,
+                    cooldown_secs,
+                    "skipping notification: within cooldown"
+                );
+                continue;
+            }
+        }
+
+        store.last_notified.insert(event.resource_id.clone(), now);
+
+        if !is_muted {
+            if is_crash && store.config.notifications.enabled && store.config.notifications.on_crash
+            {
+                send_desktop_notification(&format!("{} crashed", event.resource_name)).await;
+            }
+            if is_recovery
+                && store.config.notifications.enabled
+                && store.config.notifications.on_recovery
+            {
+                send_desktop_notification(&format!("{} recovered", event.resource_name)).await;
+            }
+        }
+
+        if is_crash {
+            send_integration_crash(&store.config, &event.resource_name).await;
+        }
+        if is_recovery {
+            send_integration_recovery(&store.config, &event.resource_name).await;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn send_desktop_notification(message: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"Giggity\"",
+        message.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let _ = Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn send_desktop_notification(_message: &str) {
+    // Desktop notifications only supported on macOS
+}
+
+async fn send_integration_crash(config: &Config, resource_name: &str) {
+    if let Some(slack) = &config.integrations.slack {
+        if slack.on_crash {
+            let payload = serde_json::json!({
+                "text": format!("\u{1f6a8} Giggity: {resource_name} crashed")
+            });
+            send_webhook(&slack.webhook_url, &payload).await;
+        }
+    }
+    if let Some(telegram) = &config.integrations.telegram {
+        if telegram.on_crash {
+            let text = format!("\u{1f6a8} Giggity: {resource_name} crashed");
+            send_telegram(&telegram.bot_token, &telegram.chat_id, &text).await;
+        }
+    }
+}
+
+async fn send_integration_recovery(config: &Config, resource_name: &str) {
+    if let Some(slack) = &config.integrations.slack {
+        if slack.on_recovery {
+            let payload = serde_json::json!({
+                "text": format!("\u{2705} Giggity: {resource_name} recovered")
+            });
+            send_webhook(&slack.webhook_url, &payload).await;
+        }
+    }
+    if let Some(telegram) = &config.integrations.telegram {
+        if telegram.on_recovery {
+            let text = format!("\u{2705} Giggity: {resource_name} recovered");
+            send_telegram(&telegram.bot_token, &telegram.chat_id, &text).await;
+        }
+    }
+}
+
+async fn send_webhook(url: &str, payload: &serde_json::Value) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(?error, "failed to build HTTP client for webhook");
+            return;
+        }
+    };
+    match client.post(url).json(payload).send().await {
+        Ok(response) if !response.status().is_success() => {
+            warn!(
+                status = %response.status(),
+                url,
+                "webhook request failed"
+            );
+        }
+        Err(error) => {
+            warn!(?error, url, "webhook request error");
+        }
+        Ok(_) => {
+            debug!(url, "webhook sent successfully");
+        }
+    }
+}
+
+async fn send_telegram(bot_token: &str, chat_id: &str, text: &str) {
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+    send_webhook(&url, &payload).await;
 }
 
 async fn handle_request(request: ClientRequest, store: Arc<RwLock<Store>>) -> ServerResponse {
@@ -220,6 +459,30 @@ async fn handle_request(request: ClientRequest, store: Arc<RwLock<Store>>) -> Se
             let guard = store.read().await;
             ServerResponse::Validation {
                 warnings: guard.config.validate(),
+            }
+        }
+        ClientRequest::ExportConfig => {
+            let guard = store.read().await;
+            match toml::to_string_pretty(&guard.config) {
+                Ok(toml) => ServerResponse::ExportedConfig { toml },
+                Err(error) => ServerResponse::Error {
+                    message: format!("failed to serialize config: {error}"),
+                },
+            }
+        }
+        ClientRequest::MuteNotifications { duration_secs } => {
+            let mut guard = store.write().await;
+            let until = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
+            guard.muted_until = Some(until);
+            ServerResponse::MuteResult {
+                message: format!("notifications muted for {duration_secs}s"),
+            }
+        }
+        ClientRequest::UnmuteNotifications => {
+            let mut guard = store.write().await;
+            guard.muted_until = None;
+            ServerResponse::MuteResult {
+                message: "notifications unmuted".into(),
             }
         }
         ClientRequest::Logs { resource_id, lines } => {
@@ -254,7 +517,11 @@ async fn handle_request(request: ClientRequest, store: Arc<RwLock<Store>>) -> Se
                 .find(|resource| resource.id == resource_id)
             {
                 Some(resource) => {
-                    if matches!(action, ActionKind::Restart | ActionKind::Stop) && !confirm {
+                    if matches!(
+                        action,
+                        ActionKind::Restart | ActionKind::Stop | ActionKind::ForceKill
+                    ) && !confirm
+                    {
                         return ServerResponse::Error {
                             message: "mutating actions require confirmation".into(),
                         };
@@ -271,7 +538,283 @@ async fn handle_request(request: ClientRequest, store: Arc<RwLock<Store>>) -> Se
                 },
             }
         }
+        ClientRequest::BulkRestart { resource_ids } => {
+            let guard = store.read().await;
+            let mut successes = 0_usize;
+            let mut failures = Vec::new();
+            for rid in &resource_ids {
+                match guard.snapshot.resources.iter().find(|r| r.id == *rid) {
+                    Some(resource) => match restart_resource(resource).await {
+                        Ok(_) => successes += 1,
+                        Err(e) => failures.push(format!("{rid}: {e}")),
+                    },
+                    None => failures.push(format!("{rid}: unknown resource")),
+                }
+            }
+            let mut parts = vec![format!("{successes}/{} restarted", resource_ids.len())];
+            if !failures.is_empty() {
+                parts.push(format!("failures: {}", failures.join("; ")));
+            }
+            ServerResponse::ActionResult {
+                message: parts.join(", "),
+            }
+        }
+        ClientRequest::StreamLogs { .. }
+        | ClientRequest::StreamEvents { .. }
+        | ClientRequest::CloseStream => ServerResponse::Error {
+            message: "streaming requests are handled at the connection level".into(),
+        },
     }
+}
+
+async fn send_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &ServerResponse,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(response)?;
+    writer.write_all(payload.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn handle_stream_logs(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    store: Arc<RwLock<Store>>,
+    resource_id: &str,
+    lines: u32,
+) -> anyhow::Result<()> {
+    let (resource, runtime) = {
+        let guard = store.read().await;
+        match guard
+            .snapshot
+            .resources
+            .iter()
+            .find(|r| r.id == resource_id)
+        {
+            Some(r) => (r.clone(), r.runtime),
+            None => {
+                send_response(
+                    &mut writer,
+                    &ServerResponse::Error {
+                        message: format!("unknown resource {resource_id}"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let args = match build_log_follow_args(&resource, lines) {
+        Ok(args) => args,
+        Err(error) => {
+            send_response(
+                &mut writer,
+                &ServerResponse::Error {
+                    message: error.to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let program = runtime_log_program(runtime);
+    let mut child = match Command::new(resolve_program(program))
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send_response(
+                &mut writer,
+                &ServerResponse::Error {
+                    message: format!("failed to spawn {program}: {error}"),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut log_reader = BufReader::new(stdout);
+    let mut close_line = String::new();
+
+    loop {
+        let mut log_line = String::new();
+        tokio::select! {
+            result = log_reader.read_line(&mut log_line) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = log_line.trim_end().to_string();
+                        if send_response(&mut writer, &ServerResponse::LogLine { line: trimmed }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            result = reader.read_line(&mut close_line) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Ok(ClientRequest::CloseStream) = serde_json::from_str(close_line.trim()) {
+                            break;
+                        }
+                        close_line.clear();
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    child.kill().await.ok();
+    child.wait().await.ok();
+    let _ = send_response(
+        &mut writer,
+        &ServerResponse::StreamEnd {
+            reason: "log stream ended".into(),
+        },
+    )
+    .await;
+    debug!(resource_id, "log stream closed");
+    Ok(())
+}
+
+fn runtime_log_program(runtime: giggity_core::model::RuntimeKind) -> &'static str {
+    match runtime {
+        giggity_core::model::RuntimeKind::Docker => "docker",
+        giggity_core::model::RuntimeKind::Podman => "podman",
+        giggity_core::model::RuntimeKind::Nerdctl => "nerdctl",
+        giggity_core::model::RuntimeKind::Kubernetes => "kubectl",
+        giggity_core::model::RuntimeKind::Systemd => "journalctl",
+        _ => "echo",
+    }
+}
+
+fn build_log_follow_args(resource: &ResourceRecord, lines: u32) -> anyhow::Result<Vec<String>> {
+    let tail = lines.max(10).to_string();
+    if resource.kind == ResourceKind::ComposeStack {
+        anyhow::bail!("log streaming unavailable for compose stack resources");
+    }
+    match resource.runtime {
+        giggity_core::model::RuntimeKind::Docker => {
+            let id = metadata(resource, "container_id")?;
+            Ok(vec![
+                "logs".into(),
+                "--tail".into(),
+                tail,
+                "--follow".into(),
+                id.into(),
+            ])
+        }
+        giggity_core::model::RuntimeKind::Podman => {
+            let id = metadata(resource, "container_id").unwrap_or(&resource.name);
+            Ok(vec![
+                "logs".into(),
+                "--tail".into(),
+                tail,
+                "--follow".into(),
+                id.into(),
+            ])
+        }
+        giggity_core::model::RuntimeKind::Nerdctl => {
+            let id = metadata(resource, "container_id").unwrap_or(&resource.name);
+            Ok(vec![
+                "logs".into(),
+                "--tail".into(),
+                tail,
+                "--follow".into(),
+                id.into(),
+            ])
+        }
+        giggity_core::model::RuntimeKind::Kubernetes => {
+            let ns = resource.namespace().unwrap_or("default");
+            Ok(vec![
+                "logs".into(),
+                "-n".into(),
+                ns.into(),
+                resource.name.clone(),
+                "--all-containers=true".into(),
+                "--tail".into(),
+                tail,
+                "-f".into(),
+            ])
+        }
+        giggity_core::model::RuntimeKind::Systemd => {
+            let mut args = vec!["-n".into(), tail, "--no-pager".into(), "-f".into()];
+            if resource.metadata.get("domain").map(String::as_str) == Some("user") {
+                args.insert(0, "--user".into());
+            }
+            args.push("-u".into());
+            args.push(resource.name.clone());
+            Ok(args)
+        }
+        _ => anyhow::bail!("log streaming unavailable for this resource type"),
+    }
+}
+
+async fn handle_stream_events(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    event_tx: broadcast::Sender<StreamEvent>,
+    _view: Option<String>,
+) -> anyhow::Result<()> {
+    let mut rx = event_tx.subscribe();
+    let mut close_line = String::new();
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(StreamEvent::StateChanged(response)) => {
+                        if send_response(&mut writer, &response).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(StreamEvent::ConfigReloaded) => {
+                        if send_response(&mut writer, &ServerResponse::ConfigReloaded).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(skipped = n, "streaming client lagged behind");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            result = reader.read_line(&mut close_line) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Ok(ClientRequest::CloseStream) = serde_json::from_str(close_line.trim()) {
+                            break;
+                        }
+                        close_line.clear();
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    let _ = send_response(
+        &mut writer,
+        &ServerResponse::StreamEnd {
+            reason: "event stream ended".into(),
+        },
+    )
+    .await;
+    debug!("event stream closed");
+    Ok(())
 }
 
 async fn fetch_logs(resource: &ResourceRecord, lines: usize) -> anyhow::Result<String> {
@@ -494,6 +1037,7 @@ fn expand_template(template: &str, resource: &ResourceRecord) -> String {
                 giggity_core::model::RuntimeKind::Kubernetes => "kubernetes",
                 giggity_core::model::RuntimeKind::Host => "host",
                 giggity_core::model::RuntimeKind::Launchd => "launchd",
+                giggity_core::model::RuntimeKind::Probes => "probes",
                 giggity_core::model::RuntimeKind::Systemd => "systemd",
             },
         )
@@ -525,6 +1069,7 @@ async fn run_action(action: &ActionKind, resource: &ResourceRecord) -> anyhow::R
         }
         ActionKind::Restart => restart_resource(resource).await,
         ActionKind::Stop => stop_resource(resource).await,
+        ActionKind::ForceKill => force_kill_resource(resource).await,
     }
 }
 
@@ -540,7 +1085,14 @@ fn opener_program() -> &'static str {
 
 async fn restart_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
     if resource.kind == ResourceKind::ComposeStack {
-        anyhow::bail!("restart is unavailable for compose stack resources");
+        let project = resource
+            .compose_project()
+            .context("compose stack missing project name")?
+            .to_owned();
+        let program =
+            compose_program(resource.runtime).context("unsupported runtime for compose stack")?;
+        run_status(program, &["compose", "-p", &project, "restart"]).await?;
+        return Ok(format!("restarted {}", resource.name));
     }
     match resource.runtime {
         giggity_core::model::RuntimeKind::Docker => {
@@ -584,10 +1136,25 @@ async fn restart_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
             run_status("launchctl", &["kickstart", "-k", &target]).await?;
         }
         giggity_core::model::RuntimeKind::Kubernetes => {
-            anyhow::bail!("restart is unavailable for kubernetes pods");
+            let namespace = resource.namespace().unwrap_or("default").to_string();
+            run_status(
+                "kubectl",
+                &[
+                    "delete",
+                    "pod",
+                    "-n",
+                    &namespace,
+                    &resource.name,
+                    "--wait=false",
+                ],
+            )
+            .await?;
         }
         giggity_core::model::RuntimeKind::Host => {
             anyhow::bail!("restart is unavailable for ad-hoc host processes");
+        }
+        giggity_core::model::RuntimeKind::Probes => {
+            anyhow::bail!("actions are not supported for probe resources");
         }
     }
     Ok(format!("restarted {}", resource.name))
@@ -595,7 +1162,14 @@ async fn restart_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
 
 async fn stop_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
     if resource.kind == ResourceKind::ComposeStack {
-        anyhow::bail!("stop is unavailable for compose stack resources");
+        let project = resource
+            .compose_project()
+            .context("compose stack missing project name")?
+            .to_owned();
+        let program =
+            compose_program(resource.runtime).context("unsupported runtime for compose stack")?;
+        run_status(program, &["compose", "-p", &project, "stop"]).await?;
+        return Ok(format!("stopped {}", resource.name));
     }
     match resource.runtime {
         giggity_core::model::RuntimeKind::Docker => {
@@ -639,25 +1213,106 @@ async fn stop_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
             run_status("launchctl", &["bootout", &target]).await?;
         }
         giggity_core::model::RuntimeKind::Kubernetes => {
-            let namespace = resource.namespace().unwrap_or("default").to_string();
-            run_status(
-                "kubectl",
-                &[
-                    "delete",
-                    "pod",
-                    "-n",
-                    &namespace,
-                    &resource.name,
-                    "--wait=false",
-                ],
-            )
-            .await?;
+            anyhow::bail!(
+                "stop is not supported for kubernetes pods; use force kill to delete the pod"
+            );
         }
         giggity_core::model::RuntimeKind::Host => {
             run_status("kill", &["-TERM", metadata(resource, "pid")?]).await?;
         }
+        giggity_core::model::RuntimeKind::Probes => {
+            anyhow::bail!("actions are not supported for probe resources");
+        }
     }
     Ok(format!("stopped {}", resource.name))
+}
+
+async fn force_kill_resource(resource: &ResourceRecord) -> anyhow::Result<String> {
+    match resource.kind {
+        ResourceKind::ComposeStack => {
+            let project = resource
+                .compose_project()
+                .context("compose stack missing project name")?
+                .to_owned();
+            let program = compose_program(resource.runtime)
+                .context("unsupported runtime for compose stack")?;
+            run_status(program, &["compose", "-p", &project, "kill"]).await?;
+        }
+        _ => match resource.runtime {
+            giggity_core::model::RuntimeKind::Docker => {
+                run_status("docker", &["kill", metadata(resource, "container_id")?]).await?;
+            }
+            giggity_core::model::RuntimeKind::Podman => {
+                run_status(
+                    "podman",
+                    &[
+                        "kill",
+                        metadata(resource, "container_id").unwrap_or(&resource.name),
+                    ],
+                )
+                .await?;
+            }
+            giggity_core::model::RuntimeKind::Nerdctl => {
+                run_status(
+                    "nerdctl",
+                    &[
+                        "kill",
+                        metadata(resource, "container_id").unwrap_or(&resource.name),
+                    ],
+                )
+                .await?;
+            }
+            giggity_core::model::RuntimeKind::Host => {
+                run_status("kill", &["-9", metadata(resource, "pid")?]).await?;
+            }
+            giggity_core::model::RuntimeKind::Launchd => {
+                let target = format!("gui/{}/{}", current_uid()?, resource.name);
+                run_status("launchctl", &["kill", "9", &target]).await?;
+            }
+            giggity_core::model::RuntimeKind::Systemd => {
+                let domain = resource
+                    .metadata
+                    .get("domain")
+                    .map(String::as_str)
+                    .unwrap_or("system");
+                let args = if domain == "user" {
+                    vec!["--user", "kill", "--signal=SIGKILL", &resource.name]
+                } else {
+                    vec!["kill", "--signal=SIGKILL", &resource.name]
+                };
+                run_status("systemctl", &args).await?;
+            }
+            giggity_core::model::RuntimeKind::Kubernetes => {
+                let namespace = resource.namespace().unwrap_or("default").to_string();
+                run_status(
+                    "kubectl",
+                    &[
+                        "delete",
+                        "pod",
+                        "-n",
+                        &namespace,
+                        &resource.name,
+                        "--grace-period=0",
+                        "--force",
+                    ],
+                )
+                .await?;
+            }
+            giggity_core::model::RuntimeKind::Probes => {
+                anyhow::bail!("actions are not supported for probe resources");
+            }
+        },
+    }
+    Ok(format!("force killed {}", resource.name))
+}
+
+fn compose_program(runtime: giggity_core::model::RuntimeKind) -> Option<&'static str> {
+    match runtime {
+        giggity_core::model::RuntimeKind::Docker => Some("docker"),
+        giggity_core::model::RuntimeKind::Podman => Some("podman"),
+        giggity_core::model::RuntimeKind::Nerdctl => Some("nerdctl"),
+        _ => None,
+    }
 }
 
 #[rustfmt::skip]
@@ -829,7 +1484,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use giggity_collectors::{CollectionOutput, CollectorProvider};
-    use giggity_core::config::{Config, MatchRule, ProbeKind, ProbeSpec};
+    use giggity_core::config::{Config, MatchRule, ProbeKind, ProbeSpec, ProbeType};
     use giggity_core::model::{
         HealthState, PortBinding, ResourceKind, ResourceRecord, RuntimeKind,
     };
@@ -840,9 +1495,10 @@ mod tests {
 
     use crate::daemon::{
         DaemonClient, Store, apply_probes, clipboard_commands, command_overrides, current_uid,
-        ensure_daemon_running, expand_template, fetch_logs, handle_request, log_config_reload,
-        metadata, nix_like_id, run_action, run_daemon, run_daemon_with_collector, run_output,
-        run_status, socket_is_live, try_copy_to_clipboard, wait_for_shutdown,
+        dispatch_notifications, ensure_daemon_running, expand_template, fetch_logs, handle_request,
+        log_config_reload, metadata, nix_like_id, run_action, run_daemon,
+        run_daemon_with_collector, run_output, run_status, socket_is_live, try_copy_to_clipboard,
+        wait_for_shutdown,
     };
 
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -884,6 +1540,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            state_since: Utc::now(),
         }
     }
 
@@ -906,6 +1563,7 @@ mod tests {
             urls: vec!["http://127.0.0.1:3000".parse().expect("url")],
             metadata: BTreeMap::from([("pid".into(), "123".into())]),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         }
     }
 
@@ -916,6 +1574,8 @@ mod tests {
                 resources: vec![resource],
                 ..Default::default()
             },
+            last_notified: Default::default(),
+            muted_until: None,
         }))
     }
 
@@ -994,6 +1654,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::from([("namespace".into(), "dev".into())]),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         }
     }
 
@@ -1016,6 +1677,7 @@ mod tests {
             urls: vec!["http://127.0.0.1:8080".parse().expect("url")],
             metadata: BTreeMap::from([("compose_project".into(), "stack".into())]),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         }
     }
 
@@ -1033,6 +1695,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::from([("domain".into(), domain.into())]),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         }
     }
 
@@ -1050,6 +1713,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::from([("pid".into(), "99".into())]),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         }
     }
 
@@ -1292,6 +1956,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         }];
         let mut config = Config::default();
         config.probes.push(ProbeSpec {
@@ -1305,6 +1970,12 @@ mod tests {
                 port: None,
             },
             timeout_millis: 500,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
 
         apply_probes(&config, &mut resources).await;
@@ -1327,6 +1998,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: Utc::now(),
+            state_since: Utc::now(),
         }];
         let mut config = Config::default();
         config.probes.push(ProbeSpec {
@@ -1341,6 +2013,12 @@ mod tests {
                 contains: Some("ok".into()),
             },
             timeout_millis: 500,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
 
         apply_probes(&config, &mut resources).await;
@@ -1368,6 +2046,12 @@ mod tests {
                 contains: Some("ok".into()),
             },
             timeout_millis: 500,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
 
         apply_probes(&config, &mut resources).await;
@@ -1400,6 +2084,12 @@ mod tests {
                 port: Some(1),
             },
             timeout_millis: 10,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
         apply_probes(&config, &mut resources).await;
         assert_eq!(resources[0].state, HealthState::Stopped);
@@ -1437,6 +2127,12 @@ mod tests {
                 expected_status: 200,
             },
             timeout_millis: 1_000,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
         apply_probes(&config, &mut resources).await;
         assert_eq!(resources[0].state, HealthState::Degraded);
@@ -1462,6 +2158,12 @@ mod tests {
                 contains: None,
             },
             timeout_millis: 500,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
         apply_probes(&config, &mut resources).await;
         assert_eq!(resources[0].state, HealthState::Healthy);
@@ -1503,6 +2205,12 @@ mod tests {
                 expected_status: 200,
             },
             timeout_millis: 1_000,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
 
         apply_probes(&config, &mut resources).await;
@@ -1533,6 +2241,12 @@ mod tests {
                 contains: Some("{name} {port}".into()),
             },
             timeout_millis: 500,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
 
         apply_probes(&config, &mut resources).await;
@@ -1560,6 +2274,12 @@ mod tests {
                 contains: Some("ok".into()),
             },
             timeout_millis: 500,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
 
         apply_probes(&config, &mut resources).await;
@@ -1827,16 +2547,14 @@ mod tests {
         assert!(
             run_action(&ActionKind::Restart, &kubernetes_resource())
                 .await
-                .expect_err("kubernetes restart")
-                .to_string()
-                .contains("unavailable")
+                .expect("kubernetes restart")
+                .contains("restarted")
         );
         assert!(
             run_action(&ActionKind::Restart, &compose_stack_resource())
                 .await
-                .expect_err("compose restart")
-                .to_string()
-                .contains("compose stack")
+                .expect("compose restart")
+                .contains("restarted")
         );
 
         assert!(
@@ -1884,15 +2602,15 @@ mod tests {
         assert!(
             run_action(&ActionKind::Stop, &kubernetes_resource())
                 .await
-                .expect("kubernetes stop")
-                .contains("stopped")
+                .expect_err("kubernetes stop")
+                .to_string()
+                .contains("not supported")
         );
         assert!(
             run_action(&ActionKind::Stop, &compose_stack_resource())
                 .await
-                .expect_err("compose stop")
-                .to_string()
-                .contains("compose stack")
+                .expect("compose stop")
+                .contains("stopped")
         );
 
         assert!(
@@ -2193,6 +2911,8 @@ mod tests {
                 resources: vec![host_resource()],
                 ..Default::default()
             },
+            last_notified: Default::default(),
+            muted_until: None,
         }));
 
         match handle_request(ClientRequest::Ping, store.clone()).await {
@@ -2351,6 +3071,12 @@ mod tests {
                 contains: None,
             },
             timeout_millis: 500,
+            retries: 0,
+            backoff_secs: 2,
+            warn_latency_ms: None,
+            critical_latency_ms: None,
+            interval_secs: 30,
+            probe_type: ProbeType::default(),
         });
         apply_probes(&config, &mut resources).await;
         assert_eq!(resources[0].state, HealthState::Degraded);
@@ -2361,5 +3087,168 @@ mod tests {
                 .unwrap_or("")
                 .contains("probe;")
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_notifications_skips_within_cooldown() {
+        use giggity_core::model::{RecentEvent, Snapshot};
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.integrations.cooldown_secs = 60;
+        config.notifications.enabled = true;
+        config.notifications.on_crash = true;
+
+        let now = Utc::now();
+        let event = RecentEvent {
+            resource_id: "docker:web".into(),
+            resource_name: "web".into(),
+            from: Some(HealthState::Healthy),
+            to: HealthState::Crashed,
+            timestamp: now,
+            cause: Some("state transition".into()),
+        };
+
+        let snapshot = Snapshot {
+            api_version: 1,
+            generated_at: now,
+            resources: Vec::new(),
+            events: vec![event.clone()],
+            warnings: Vec::new(),
+            last_crash_at: None,
+        };
+
+        // First dispatch should record the notification
+        let mut store = Store {
+            config: config.clone(),
+            snapshot: Snapshot::default(),
+            muted_until: None,
+            last_notified: HashMap::new(),
+        };
+        dispatch_notifications(&mut store, &snapshot).await;
+        assert!(store.last_notified.contains_key("docker:web"));
+
+        // Second dispatch within cooldown should not update the timestamp
+        let first_notified = store.last_notified["docker:web"];
+        dispatch_notifications(&mut store, &snapshot).await;
+        assert_eq!(store.last_notified["docker:web"], first_notified);
+    }
+
+    #[tokio::test]
+    async fn dispatch_notifications_allows_after_cooldown_expires() {
+        use giggity_core::model::{RecentEvent, Snapshot};
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.integrations.cooldown_secs = 1;
+        config.notifications.enabled = true;
+        config.notifications.on_crash = true;
+
+        let now = Utc::now();
+        let event = RecentEvent {
+            resource_id: "docker:api".into(),
+            resource_name: "api".into(),
+            from: Some(HealthState::Healthy),
+            to: HealthState::Crashed,
+            timestamp: now,
+            cause: Some("state transition".into()),
+        };
+
+        let snapshot = Snapshot {
+            api_version: 1,
+            generated_at: now,
+            resources: Vec::new(),
+            events: vec![event],
+            warnings: Vec::new(),
+            last_crash_at: None,
+        };
+
+        // Pre-populate last_notified as if it was notified 2 seconds ago
+        let mut last_notified = HashMap::new();
+        last_notified.insert("docker:api".into(), now - chrono::Duration::seconds(2));
+
+        let mut store = Store {
+            config,
+            snapshot: Snapshot::default(),
+            muted_until: None,
+            last_notified,
+        };
+
+        dispatch_notifications(&mut store, &snapshot).await;
+        // The timestamp should have been updated since cooldown (1s) has passed
+        let updated = store.last_notified["docker:api"];
+        assert!(updated > now - chrono::Duration::seconds(1));
+    }
+
+    #[tokio::test]
+    async fn dispatch_notifications_respects_custom_cooldown_from_config() {
+        use giggity_core::model::{RecentEvent, Snapshot};
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.integrations.cooldown_secs = 600; // 10 minutes
+
+        let now = Utc::now();
+        let event = RecentEvent {
+            resource_id: "docker:db".into(),
+            resource_name: "db".into(),
+            from: Some(HealthState::Healthy),
+            to: HealthState::Crashed,
+            timestamp: now,
+            cause: None,
+        };
+
+        let snapshot = Snapshot {
+            api_version: 1,
+            generated_at: now,
+            resources: Vec::new(),
+            events: vec![event],
+            warnings: Vec::new(),
+            last_crash_at: None,
+        };
+
+        // Notified 5 minutes ago -- within the 10-minute cooldown
+        let mut last_notified = HashMap::new();
+        last_notified.insert("docker:db".into(), now - chrono::Duration::seconds(300));
+
+        let mut store = Store {
+            config,
+            snapshot: Snapshot::default(),
+            muted_until: None,
+            last_notified,
+        };
+
+        let before = store.last_notified["docker:db"];
+        dispatch_notifications(&mut store, &snapshot).await;
+        // Should NOT have updated because 300s < 600s cooldown
+        assert_eq!(store.last_notified["docker:db"], before);
+    }
+
+    #[test]
+    fn cooldown_secs_defaults_to_300() {
+        let config = Config::default();
+        assert_eq!(config.integrations.cooldown_secs, 300);
+    }
+
+    #[test]
+    fn cooldown_secs_is_configurable_via_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[integrations]
+cooldown_secs = 120
+"#,
+        )
+        .expect("parse");
+        assert_eq!(config.integrations.cooldown_secs, 120);
+    }
+
+    #[test]
+    fn cooldown_secs_is_configurable_via_tmux_overrides() {
+        let mut config = Config::default();
+        config.merge_tmux_overrides(&std::collections::BTreeMap::from([(
+            "cooldown_secs".into(),
+            "60".into(),
+        )]));
+        assert_eq!(config.integrations.cooldown_secs, 60);
     }
 }

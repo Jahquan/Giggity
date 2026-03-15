@@ -69,7 +69,7 @@ async fn collect_docker() -> anyhow::Result<Vec<ResourceRecord>> {
         }))
         .await?;
 
-    Ok(containers
+    let mut records: Vec<ResourceRecord> = containers
         .into_iter()
         .map(|container| {
             let id = container.id.unwrap_or_default();
@@ -115,6 +115,44 @@ async fn collect_docker() -> anyhow::Result<Vec<ResourceRecord>> {
             if let Some(status) = &container.status {
                 metadata.insert("status".into(), status.clone());
             }
+            if let Some(image) = &container.image {
+                let (img, tag) = split_image_tag(image);
+                metadata.insert("image".into(), img.to_string());
+                metadata.insert("image_tag".into(), tag.to_string());
+            }
+            if let Some(network_settings) = &container.network_settings {
+                if let Some(networks) = &network_settings.networks {
+                    let mut net_names = Vec::new();
+                    let mut net_ips = Vec::new();
+                    for (name, endpoint) in networks {
+                        net_names.push(name.clone());
+                        if let Some(ip) = &endpoint.ip_address {
+                            if !ip.is_empty() {
+                                net_ips.push(format!("{name}={ip}"));
+                            }
+                        }
+                    }
+                    if !net_names.is_empty() {
+                        metadata.insert("networks".into(), net_names.join(","));
+                    }
+                    if !net_ips.is_empty() {
+                        metadata.insert("network_ips".into(), net_ips.join(","));
+                    }
+                }
+            }
+            if let Some(mounts) = &container.mounts {
+                let mount_strs: Vec<String> = mounts
+                    .iter()
+                    .filter_map(|m| {
+                        let src = m.source.as_deref().unwrap_or("?");
+                        let dst = m.destination.as_deref()?;
+                        Some(format!("{src}:{dst}"))
+                    })
+                    .collect();
+                if !mount_strs.is_empty() {
+                    metadata.insert("mounts".into(), mount_strs.join(","));
+                }
+            }
             ResourceRecord {
                 id: format!("docker:{id}"),
                 kind: ResourceKind::Container,
@@ -128,9 +166,32 @@ async fn collect_docker() -> anyhow::Result<Vec<ResourceRecord>> {
                 urls,
                 metadata,
                 last_changed: chrono::Utc::now(),
+                state_since: chrono::Utc::now(),
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    enrich_docker_env_vars(&docker, &mut records).await;
+    Ok(records)
+}
+
+async fn enrich_docker_env_vars(docker: &Docker, records: &mut [ResourceRecord]) {
+    for record in records {
+        let container_id = match record.metadata.get("container_id") {
+            Some(id) => id.clone(),
+            None => continue,
+        };
+        let inspect = match docker.inspect_container(&container_id, None).await {
+            Ok(inspect) => inspect,
+            Err(_) => continue,
+        };
+        if let Some(config) = inspect.config {
+            if let Some(env) = config.env {
+                if !env.is_empty() {
+                    record.metadata.insert("env".into(), format_env_vars(&env));
+                }
+            }
+        }
+    }
 }
 
 fn docker_client() -> anyhow::Result<Docker> {
@@ -239,16 +300,17 @@ async fn enrich_compose_stack(resource: &mut ResourceRecord) -> anyhow::Result<(
         "{}/{} running",
         details.running_count, details.service_count
     ));
-    resource
-        .metadata
-        .insert("compose_running_count".into(), details.running_count.to_string());
-    resource
-        .metadata
-        .insert("compose_service_count".into(), details.service_count.to_string());
     resource.metadata.insert(
-        "compose_services".into(),
-        details.services.join(","),
+        "compose_running_count".into(),
+        details.running_count.to_string(),
     );
+    resource.metadata.insert(
+        "compose_service_count".into(),
+        details.service_count.to_string(),
+    );
+    resource
+        .metadata
+        .insert("compose_services".into(), details.services.join(","));
     if let Some(status) = details.project_status.take() {
         resource.metadata.insert("compose_status".into(), status);
     }
@@ -326,8 +388,12 @@ async fn compose_ls_details(
     program: &str,
     project: &str,
 ) -> anyhow::Result<Option<ComposeLsEntry>> {
-    let output = run_command("containers", program, &["compose", "ls", "-a", "--format", "json"])
-        .await?;
+    let output = run_command(
+        "containers",
+        program,
+        &["compose", "ls", "-a", "--format", "json"],
+    )
+    .await?;
     let entries: Vec<ComposeLsEntry> = serde_json::from_str(&output)?;
     Ok(entries.into_iter().find(|entry| entry.name == project))
 }
@@ -458,6 +524,7 @@ fn compose_stack_record(
         urls,
         metadata,
         last_changed: latest_change,
+        state_since: latest_change,
     }
 }
 
@@ -588,6 +655,21 @@ fn podman_record(item: PodmanPsItem, runtime: RuntimeKind) -> ResourceRecord {
     if let Some(status) = &item.status {
         metadata.insert("status".into(), status.clone());
     }
+    if let Some(image) = &item.image {
+        let (img, tag) = split_image_tag(image);
+        metadata.insert("image".into(), img.to_string());
+        metadata.insert("image_tag".into(), tag.to_string());
+    }
+    if let Some(mounts) = &item.mounts {
+        if !mounts.is_empty() {
+            metadata.insert("mounts".into(), mounts.clone());
+        }
+    }
+    if let Some(networks) = &item.networks {
+        if !networks.is_empty() {
+            metadata.insert("networks".into(), networks.clone());
+        }
+    }
     ResourceRecord {
         id: format!("{}:{id}", runtime),
         kind: ResourceKind::Container,
@@ -605,6 +687,7 @@ fn podman_record(item: PodmanPsItem, runtime: RuntimeKind) -> ResourceRecord {
         urls: guess_local_urls_for_ports(&ports),
         metadata,
         last_changed: chrono::Utc::now(),
+        state_since: chrono::Utc::now(),
     }
 }
 
@@ -622,6 +705,11 @@ fn nerdctl_record(item: NerdctlPsItem) -> ResourceRecord {
     if let Some(status) = item.status.clone() {
         metadata.insert("status".into(), status.clone());
     }
+    if let Some(image) = &item.image {
+        let (img, tag) = split_image_tag(image);
+        metadata.insert("image".into(), img.to_string());
+        metadata.insert("image_tag".into(), tag.to_string());
+    }
     ResourceRecord {
         id: format!("nerdctl:{}", item.id),
         kind: ResourceKind::Container,
@@ -635,6 +723,7 @@ fn nerdctl_record(item: NerdctlPsItem) -> ResourceRecord {
         urls: guess_local_urls_for_ports(&ports),
         metadata,
         last_changed: chrono::Utc::now(),
+        state_since: chrono::Utc::now(),
     }
 }
 
@@ -678,6 +767,41 @@ fn docker_socket_override() -> &'static Mutex<Option<PathBuf>> {
     DOCKER_SOCKET_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
+fn split_image_tag(image: &str) -> (&str, &str) {
+    // Handle images like "registry.io/repo:tag" or "repo:tag" or "repo@sha256:..."
+    if let Some(at_pos) = image.rfind('@') {
+        return (&image[..at_pos], &image[at_pos + 1..]);
+    }
+    // Find colon after the last slash (to avoid matching registry port)
+    let after_slash = image.rfind('/').map(|i| i + 1).unwrap_or(0);
+    match image[after_slash..].find(':') {
+        Some(pos) => (&image[..after_slash + pos], &image[after_slash + pos + 1..]),
+        None => (image, "latest"),
+    }
+}
+
+const SENSITIVE_ENV_KEYS: &[&str] = &["PASSWORD", "SECRET", "TOKEN", "KEY", "API_KEY"];
+
+fn sanitize_env_value(key: &str, value: &str) -> String {
+    let upper = key.to_ascii_uppercase();
+    for sensitive in SENSITIVE_ENV_KEYS {
+        if upper.contains(sensitive) {
+            return "***REDACTED***".into();
+        }
+    }
+    value.to_string()
+}
+
+fn format_env_vars(env: &[String]) -> String {
+    env.iter()
+        .map(|entry| match entry.split_once('=') {
+            Some((key, value)) => format!("{}={}", key, sanitize_env_value(key, value)),
+            None => entry.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub fn parse_port_specs(spec: &str) -> Vec<PortBinding> {
     spec.split(',')
         .filter_map(|segment| {
@@ -707,6 +831,9 @@ struct PodmanPsItem {
     id: Option<String>,
     #[serde(rename = "Names", default)]
     names: Vec<String>,
+    #[serde(rename = "Image")]
+    #[serde(default)]
+    image: Option<String>,
     #[serde(rename = "Status")]
     status: Option<String>,
     #[serde(rename = "State")]
@@ -715,6 +842,10 @@ struct PodmanPsItem {
     labels: Option<BTreeMap<String, String>>,
     #[serde(rename = "Ports", default)]
     ports: PodmanPorts,
+    #[serde(rename = "Mounts", default)]
+    mounts: Option<String>,
+    #[serde(rename = "Networks", default)]
+    networks: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -744,6 +875,9 @@ struct NerdctlPsItem {
     id: String,
     #[serde(rename = "Names")]
     names: String,
+    #[serde(rename = "Image")]
+    #[serde(default)]
+    image: Option<String>,
     #[serde(rename = "State")]
     state: Option<String>,
     #[serde(rename = "Status")]
@@ -889,6 +1023,7 @@ mod tests {
             PodmanPsItem {
                 id: Some("abc123".into()),
                 names: vec!["web".into()],
+                image: None,
                 status: Some("Up 10s".into()),
                 state: Some("running".into()),
                 labels: Some(BTreeMap::from([(
@@ -896,6 +1031,8 @@ mod tests {
                     "stack".into(),
                 )])),
                 ports: PodmanPorts::Strings(vec!["0.0.0.0:8080->80/tcp".into()]),
+                mounts: None,
+                networks: None,
             },
             RuntimeKind::Podman,
         );
@@ -911,6 +1048,7 @@ mod tests {
             PodmanPsItem {
                 id: Some("def456".into()),
                 names: vec!["api".into()],
+                image: None,
                 status: Some("Up 3s".into()),
                 state: Some("running".into()),
                 labels: Some(BTreeMap::new()),
@@ -920,6 +1058,8 @@ mod tests {
                     container_port: Some(8080),
                     protocol: Some("tcp".into()),
                 }]),
+                mounts: None,
+                networks: None,
             },
             RuntimeKind::Podman,
         );
@@ -935,6 +1075,7 @@ mod tests {
         let record = nerdctl_record(NerdctlPsItem {
             id: "def456".into(),
             names: "api".into(),
+            image: None,
             state: Some("running".into()),
             status: Some("Up 2m".into()),
             ports: "0.0.0.0:9000->9000/tcp".into(),
@@ -971,6 +1112,7 @@ mod tests {
             urls: guess_local_urls_for_ports(&parse_port_specs("0.0.0.0:8080->80/tcp")),
             metadata: BTreeMap::new(),
             last_changed: chrono::Utc::now(),
+            state_since: chrono::Utc::now(),
         };
         let worker = ResourceRecord {
             id: "docker:worker".into(),
@@ -985,6 +1127,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: chrono::Utc::now(),
+            state_since: chrono::Utc::now(),
         };
 
         let stacks = synthesize_compose_stacks(&[web.clone(), worker.clone()]);
@@ -1031,6 +1174,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: chrono::Utc::now(),
+            state_since: chrono::Utc::now(),
         };
         let host = ResourceRecord {
             id: "host:123".into(),
@@ -1045,6 +1189,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: chrono::Utc::now(),
+            state_since: chrono::Utc::now(),
         };
 
         assert!(synthesize_compose_stacks(&[host]).is_empty());
@@ -1066,6 +1211,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: chrono::Utc::now(),
+            state_since: chrono::Utc::now(),
         };
         let second = ResourceRecord {
             name: "worker".into(),
@@ -1095,6 +1241,7 @@ mod tests {
             urls: Vec::new(),
             metadata: BTreeMap::new(),
             last_changed: chrono::Utc::now(),
+            state_since: chrono::Utc::now(),
         };
         let second = ResourceRecord {
             name: "worker".into(),
@@ -1480,10 +1627,13 @@ mod tests {
             PodmanPsItem {
                 id: None,
                 names: Vec::new(),
+                image: None,
                 status: None,
                 state: Some("created".into()),
                 labels: None,
                 ports: PodmanPorts::Empty,
+                mounts: None,
+                networks: None,
             },
             RuntimeKind::Podman,
         );
@@ -1493,6 +1643,7 @@ mod tests {
         let nerdctl = nerdctl_record(NerdctlPsItem {
             id: "id".into(),
             names: "api".into(),
+            image: None,
             state: Some("error".into()),
             status: None,
             ports: String::new(),
