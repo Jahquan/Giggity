@@ -2,7 +2,7 @@
 
 Giggity is a Rust-first tmux dashboard for developers who run a lot of local services and containers.
 
-It keeps a system-wide snapshot of what is running on the machine, renders a compact tmux status segment, and provides an interactive popup for inspection and operator actions. The current release is V3, building on V2's multi-runtime foundation with streaming, notifications, integrations, health probes, and a fully-featured TUI.
+It keeps a system-wide snapshot of what is running on the machine, renders a compact tmux status segment, and provides an interactive popup for inspection and operator actions.
 
 ## What Giggity Does
 
@@ -62,7 +62,7 @@ Giggity understands:
 
 ### Container data enrichment
 
-V3 enriches container metadata with:
+Giggity enriches container metadata with:
 
 - **Image info** — image name and tag extracted into metadata
 - **Network info** — network names and IPs
@@ -130,7 +130,7 @@ Those states come from runtime/service-manager status first, then can be refined
 
 ### State intelligence
 
-V3 adds automatic state analysis:
+Giggity includes automatic state analysis:
 
 - **Port conflict detection** — flags resources listening on the same port
 - **Restart flapping detection** — marks resources that crash/restart more than 3 times in 10 minutes
@@ -140,7 +140,7 @@ V3 adds automatic state analysis:
 
 Probes let you turn "the process is running" into "the service is actually healthy."
 
-V3 adds standalone probe resources alongside the existing probe-as-override system:
+Giggity supports standalone probe resources alongside the existing probe-as-override system:
 
 - **HTTP probes** — GET a URL, check status code, measure latency
 - **TCP probes** — connect with timeout
@@ -158,7 +158,7 @@ Templates in probe values can reference `{id}`, `{name}`, `{project}`, `{port}`,
 
 ### Protocol streaming
 
-V3 introduces streaming over the daemon socket:
+Giggity supports streaming over the daemon socket:
 
 - **StreamLogs** — tail logs for a resource with real-time updates
 - **StreamEvents** — subscribe to state transition events for a view
@@ -172,7 +172,7 @@ V3 introduces streaming over the daemon socket:
 
 ### Integrations
 
-V3 supports two notification integrations:
+Giggity supports two notification integrations:
 
 - **Slack** — webhook-based crash/recovery alerts
 - **Telegram** — bot API crash/recovery messages
@@ -182,7 +182,7 @@ V3 supports two notification integrations:
 
 Giggity renders a compact tmux segment through `#(...)`.
 
-V3 status bar features:
+Status bar features:
 
 - theme-aware in tmux mode
 - template-driven
@@ -197,7 +197,7 @@ V3 status bar features:
 
 The popup is for deeper inspection when the status line says something is wrong.
 
-V3 popup features:
+Popup features:
 
 - refresh-driven live inventory
 - **grouped resource list** — visual group headers (yellow, bold) when grouping is active
@@ -221,11 +221,11 @@ Giggity supports these quick actions:
 - `logs`
 - `restart`
 - `stop`
-- `force-kill` (V3)
+- `force-kill`
 - `open-url`
 - `copy-port`
-- `copy-id` (V3)
-- `bulk-restart` (V3)
+- `copy-id`
+- `bulk-restart`
 
 Actions are runtime-aware:
 
@@ -252,7 +252,7 @@ The popup details view can surface those recent events so the user has context f
 
 ### Config management
 
-V3 adds:
+Giggity also supports:
 
 - **Config export** — `ExportConfig` request returns effective config as TOML
 - **Config hot-reload** — status bar flash on config file changes
