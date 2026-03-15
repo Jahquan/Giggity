@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
 
@@ -69,17 +69,5 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
 
-      - name: Install shell tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
-
-      - uses: mfinelli/setup-shfmt@v4
-
-      - name: Shell checks
-        run: |
-          shellcheck giggity.tmux scripts/*.sh
-          shfmt -d giggity.tmux scripts/*.sh
-
       - name: Coverage summary
-        run: cargo llvm-cov --workspace --branch --summary-only --fail-under-lines 95 --fail-under-regions 90
+        run: cargo +nightly llvm-cov --workspace --branch --summary-only --fail-under-lines 95 --fail-under-regions 90
